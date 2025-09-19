@@ -1,0 +1,11 @@
+# Ignorer les environnements virtuels
+venv/
+__pycache__/
+*.pyc
+
+# Fichiers sensibles
+.env
+
+# Fichiers système Windows/Mac
+.DS_Store
+Thumbs.db
