@@ -5,6 +5,7 @@ from datetime import datetime
 from db import get_connection
 from typing import Optional, List
 from fastapi import Query
+from fastapi import Path
 
 
 
@@ -113,3 +114,30 @@ def list_conversations(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
+
+class ConversationDetail(BaseModel):
+    id: int
+    user_name: str
+    date_conversation: datetime
+    conversation: str
+
+@app.get("/conversations/{id}")
+def get_conversation_by_id(id: int = Path(..., ge=1)):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, user_name, date_conversation, conversation FROM conversations WHERE id = %s;",
+            (id,)
+        )
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        return ConversationDetail(
+            id=row[0], user_name=row[1], date_conversation=row[2], conversation=row[3] or ""
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
