@@ -5,7 +5,7 @@ from typing import Optional, List, Literal
 from datetime import datetime
 from db import get_connection
 
-app = FastAPI(title="Conversation Logger API", version="1.4.0")
+app = FastAPI(title="Conversation Logger API", version="1.5.0")
 
 # ---------------------------
 # Models (conversations)
@@ -50,6 +50,24 @@ class SujetSummary(BaseModel):
     sujet: str
 
 # ---------------------------
+# NEW: Models (sous-sujet)
+# ---------------------------
+class SousSujetIn(BaseModel):
+    sujet_id: int = Field(..., ge=1)
+    titre: str = Field(..., min_length=1)
+
+class SousSujetOut(BaseModel):
+    id: int
+    sujet_id: int
+    titre: str
+    created_at: datetime
+
+class SousSujetSummary(BaseModel):
+    id: int
+    sujet_id: int
+    titre: str
+
+# ---------------------------
 # Models (actions tree)
 # ---------------------------
 Status = Literal["nouvelle", "en_cours", "bloquee", "terminee", "annulee"]
@@ -80,8 +98,9 @@ class ActionNodeIn(BaseModel):
     plant_site: Optional[str] = None
     sous_actions: Optional[List[SousActionNodeIn]] = None
 
+# CHANGED: payload now expects sous_sujet_id (not sujet_id)
 class ActionsBulkIn(BaseModel):
-    sujet_id: int = Field(..., ge=1)
+    sous_sujet_id: int = Field(..., ge=1)
     actions: List[ActionNodeIn]
 
 class SousSousActionNodeOut(BaseModel):
@@ -96,6 +115,7 @@ class ActionNodeOut(BaseModel):
     sous_actions: Optional[List[SousActionNodeOut]] = None
 
 class ActionsBulkOut(BaseModel):
+    # kept for compatibility; we return parent sujet_id for context
     sujet_id: int
     created: List[ActionNodeOut]
 
@@ -128,9 +148,20 @@ class ActionTreeItem(BaseModel):
     plant_site: Optional[str] = None
     sous_actions: Optional[List[SousActionTreeItem]] = None
 
+# legacy response for GET /actions?sujet_id=...
 class ActionsTreeOut(BaseModel):
     sujet_id: int
     actions: List[ActionTreeItem]
+
+# NEW: tree by sujet including sous-sujets
+class SousSujetTreeItem(BaseModel):
+    sous_sujet_id: int
+    titre: str
+    actions: Optional[List[ActionTreeItem]] = None
+
+class SujetTreeOut(BaseModel):
+    sujet_id: int
+    sous_sujets: List[SousSujetTreeItem]
 
 # ---------------------------
 # Health
@@ -147,20 +178,18 @@ def save_conversation(payload: ConversationIn):
     try:
         conn = get_connection()
         cur = conn.cursor()
-
         date_conv = payload.date_conversation or datetime.utcnow()
-
-        sql = """
+        cur.execute(
+            """
             INSERT INTO conversations (user_name, conversation, date_conversation)
             VALUES (%s, %s, %s)
             RETURNING id;
-        """
-        cur.execute(sql, (payload.user_name.strip(), payload.conversation, date_conv))
+            """,
+            (payload.user_name.strip(), payload.conversation, date_conv),
+        )
         new_id = cur.fetchone()[0]
-
         conn.commit()
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
         return ConversationOut(id=new_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Insertion échouée: {e}")
@@ -178,37 +207,31 @@ def list_conversations(
     try:
         conn = get_connection()
         cur = conn.cursor()
-
-        where = []
-        params = []
+        where, params = [], []
         if date:
             where.append("DATE(date_conversation AT TIME ZONE 'UTC') = %s")
             params.append(date)
         if user_name:
             where.append("LOWER(user_name) LIKE %s")
             params.append(f"%{user_name.lower()}%")
-
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        sql = f"""
+        cur.execute(
+            f"""
             SELECT id, user_name, date_conversation, conversation
             FROM conversations
             {where_sql}
             ORDER BY date_conversation DESC, id DESC
             LIMIT %s OFFSET %s;
-        """
-        cur.execute(sql, (*params, limit, offset))
+            """,
+            (*params, limit, offset),
+        )
         rows = cur.fetchall()
-
-        # total
-        sql_count = f"SELECT COUNT(*) FROM conversations {where_sql};"
-        cur.execute(sql_count, tuple(params))
+        cur.execute(f"SELECT COUNT(*) FROM conversations {where_sql};", tuple(params))
         total = cur.fetchone()[0]
-
         items: List[ConversationSummary] = []
         for (cid, uname, dconv, conv) in rows:
             preview = conv[:140]
             items.append(ConversationSummary(id=cid, user_name=uname, date_conversation=dconv, preview=preview))
-
         cur.close(); conn.close()
         return {"items": items, "total": total}
     except Exception as e:
@@ -222,16 +245,17 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, user_name, date_conversation, conversation
             FROM conversations WHERE id=%s;
-        """, (id,))
+            """,
+            (id,),
+        )
         row = cur.fetchone()
         cur.close(); conn.close()
-
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
-
         return ConversationDetail(id=row[0], user_name=row[1], date_conversation=row[2], conversation=row[3])
     except HTTPException:
         raise
@@ -250,11 +274,8 @@ def export_conversation_txt(id: int = Path(..., ge=1)):
         cur.execute("SELECT conversation FROM conversations WHERE id=%s;", (id,))
         row = cur.fetchone()
         cur.close(); conn.close()
-
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
-
-        # Remplacer la virgule séparatrice par des nouvelles lignes pour l'affichage "chat"
         txt = row[0].replace(" , ", "\n")
         return PlainTextResponse(content=txt, media_type="text/plain")
     except HTTPException:
@@ -270,31 +291,34 @@ def create_sujet(payload: SujetIn):
     try:
         conn = get_connection()
         cur = conn.cursor()
-
-        # Check conversation exists
         cur.execute("SELECT 1 FROM conversations WHERE id=%s;", (payload.conversation_id,))
         if cur.fetchone() is None:
             cur.close(); conn.close()
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        # Prevent duplicate subject per conversation
-        cur.execute("""
+        # one subject per conversation (return existing if same text)
+        cur.execute(
+            """
             SELECT id FROM sujet
             WHERE conversation_id=%s AND sujet=%s;
-        """, (payload.conversation_id, payload.sujet))
+            """,
+            (payload.conversation_id, payload.sujet),
+        )
         existing = cur.fetchone()
         if existing:
-            # return existing (409 or 200 – here 200 returning existing is pragmatic)
             cur.execute("SELECT id, conversation_id, sujet, created_at FROM sujet WHERE id=%s;", (existing[0],))
             s = cur.fetchone()
             cur.close(); conn.close()
             return SujetOut(id=s[0], conversation_id=s[1], sujet=s[2], created_at=s[3])
 
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO sujet (conversation_id, sujet, created_at)
             VALUES (%s, %s, now())
             RETURNING id, conversation_id, sujet, created_at;
-        """, (payload.conversation_id, payload.sujet))
+            """,
+            (payload.conversation_id, payload.sujet),
+        )
         s = cur.fetchone()
         conn.commit()
         cur.close(); conn.close()
@@ -313,26 +337,24 @@ def list_sujets(
     try:
         conn = get_connection()
         cur = conn.cursor()
-
-        where = []
-        params = []
+        where, params = [], []
         if conversation_id:
             where.append("conversation_id = %s")
             params.append(conversation_id)
-
         where_sql = "WHERE " + " AND ".join(where) if where else ""
-        cur.execute(f"""
+        cur.execute(
+            f"""
             SELECT id, conversation_id, sujet, created_at
             FROM sujet
             {where_sql}
             ORDER BY created_at DESC, id DESC
             LIMIT %s OFFSET %s;
-        """, (*params, limit, offset))
+            """,
+            (*params, limit, offset),
+        )
         rows = cur.fetchall()
-
         cur.execute(f"SELECT COUNT(*) FROM sujet {where_sql};", tuple(params))
         total = cur.fetchone()[0]
-
         items = [SujetSummary(id=r[0], conversation_id=r[1], sujet=r[2]) for r in rows]
         cur.close(); conn.close()
         return {"items": items, "total": total}
@@ -344,18 +366,19 @@ def list_sujets_by_conversation(id: int = Path(..., ge=1)):
     try:
         conn = get_connection()
         cur = conn.cursor()
-
         cur.execute("SELECT 1 FROM conversations WHERE id=%s;", (id,))
         if cur.fetchone() is None:
             cur.close(); conn.close()
             raise HTTPException(status_code=404, detail="Conversation not found")
-
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, conversation_id, sujet, created_at
             FROM sujet
             WHERE conversation_id=%s
             ORDER BY id ASC;
-        """, (id,))
+            """,
+            (id,),
+        )
         rows = cur.fetchall()
         cur.close(); conn.close()
         return [SujetOut(id=r[0], conversation_id=r[1], sujet=r[2], created_at=r[3]) for r in rows]
@@ -369,10 +392,13 @@ def get_sujet_by_id(id: int = Path(..., ge=1)):
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, conversation_id, sujet, created_at
             FROM sujet WHERE id=%s;
-        """, (id,))
+            """,
+            (id,),
+        )
         row = cur.fetchone()
         cur.close(); conn.close()
         if not row:
@@ -384,7 +410,70 @@ def get_sujet_by_id(id: int = Path(..., ge=1)):
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# ACTIONS (bulk insert + tree read) via sujet_id
+# NEW: SOUS-SUJETS
+# ---------------------------
+@app.post("/sous-sujets", response_model=SousSujetOut)
+def create_sous_sujet(payload: SousSujetIn):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (payload.sujet_id,))
+        if cur.fetchone() is None:
+            cur.close(); conn.close()
+            raise HTTPException(status_code=404, detail="Sujet not found")
+
+        cur.execute(
+            """
+            INSERT INTO sous_sujet (sujet_id, titre, created_at)
+            VALUES (%s, %s, now())
+            RETURNING id, sujet_id, titre, created_at;
+            """,
+            (payload.sujet_id, payload.titre),
+        )
+        r = cur.fetchone()
+        conn.commit()
+        cur.close(); conn.close()
+        return SousSujetOut(id=r[0], sujet_id=r[1], titre=r[2], created_at=r[3])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Insertion failed: {e}")
+
+@app.get("/sous-sujets")
+def list_sous_sujets(
+    sujet_id: Optional[int] = Query(None, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        where, params = [], []
+        if sujet_id:
+            where.append("sujet_id = %s")
+            params.append(sujet_id)
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        cur.execute(
+            f"""
+            SELECT id, sujet_id, titre, created_at
+            FROM sous_sujet
+            {where_sql}
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s OFFSET %s;
+            """,
+            (*params, limit, offset),
+        )
+        rows = cur.fetchall()
+        cur.execute(f"SELECT COUNT(*) FROM sous_sujet {where_sql};", tuple(params))
+        total = cur.fetchone()[0]
+        items = [SousSujetSummary(id=r[0], sujet_id=r[1], titre=r[2]) for r in rows]
+        cur.close(); conn.close()
+        return {"items": items, "total": total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# ACTIONS (bulk insert) via sous_sujet_id
 # ---------------------------
 @app.post("/actions/bulk", response_model=ActionsBulkOut)
 def create_actions_bulk(payload: ActionsBulkIn):
@@ -392,22 +481,24 @@ def create_actions_bulk(payload: ActionsBulkIn):
         conn = get_connection()
         cur = conn.cursor()
 
-        # Check sujet exists
-        cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (payload.sujet_id,))
-        if cur.fetchone() is None:
+        # Check sous-sujet exists & get parent sujet_id for response context
+        cur.execute("SELECT sujet_id FROM sous_sujet WHERE id=%s;", (payload.sous_sujet_id,))
+        row = cur.fetchone()
+        if row is None:
             cur.close(); conn.close()
-            raise HTTPException(status_code=404, detail="Sujet not found")
+            raise HTTPException(status_code=404, detail="Sous-sujet not found")
+        sujet_id_for_response = row[0]
 
         created: List[ActionNodeOut] = []
         try:
             for a in payload.actions:
                 cur.execute(
                     """
-                    INSERT INTO action (id_sujet, task, responsible, due_date, status, product_line, plant_site)
+                    INSERT INTO action (id_sous_sujet, task, responsible, due_date, status, product_line, plant_site)
                     VALUES (%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id;
                     """,
-                    (payload.sujet_id, a.task, a.responsible, a.due_date, a.status, a.product_line, a.plant_site)
+                    (payload.sous_sujet_id, a.task, a.responsible, a.due_date, a.status, a.product_line, a.plant_site),
                 )
                 action_id = cur.fetchone()[0]
                 sa_out: List[SousActionNodeOut] = []
@@ -420,7 +511,7 @@ def create_actions_bulk(payload: ActionsBulkIn):
                             VALUES (%s,%s,%s,%s,%s,%s,%s)
                             RETURNING id;
                             """,
-                            (action_id, sa.task, sa.responsible, sa.due_date, sa.status, sa.product_line, sa.plant_site)
+                            (action_id, sa.task, sa.responsible, sa.due_date, sa.status, sa.product_line, sa.plant_site),
                         )
                         sous_action_id = cur.fetchone()[0]
                         ssa_out: List[SousSousActionNodeOut] = []
@@ -433,7 +524,7 @@ def create_actions_bulk(payload: ActionsBulkIn):
                                     VALUES (%s,%s,%s,%s,%s,%s,%s)
                                     RETURNING id;
                                     """,
-                                    (sous_action_id, ssa.task, ssa.responsible, ssa.due_date, ssa.status, ssa.product_line, ssa.plant_site)
+                                    (sous_action_id, ssa.task, ssa.responsible, ssa.due_date, ssa.status, ssa.product_line, ssa.plant_site),
                                 )
                                 ssa_out.append(SousSousActionNodeOut(sous_sous_action_id=cur.fetchone()[0]))
 
@@ -447,12 +538,15 @@ def create_actions_bulk(payload: ActionsBulkIn):
             raise
 
         cur.close(); conn.close()
-        return ActionsBulkOut(sujet_id=payload.sujet_id, created=created)
+        return ActionsBulkOut(sujet_id=sujet_id_for_response, created=created)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Insertion failed: {e}")
 
+# ---------------------------
+# LEGACY: list actions by sujet (kept for compatibility)
+# ---------------------------
 class ActionsTreeOutResp(BaseModel):
     sujet_id: int
     actions: List[ActionTreeItem]
@@ -468,57 +562,201 @@ def list_actions_by_sujet(sujet_id: int = Query(..., ge=1)):
             cur.close(); conn.close()
             raise HTTPException(status_code=404, detail="Sujet not found")
 
-        # Actions
-        cur.execute("""
-            SELECT id, task, responsible, due_date, status, product_line, plant_site
-            FROM action
-            WHERE id_sujet=%s
-            ORDER BY id ASC;
-        """, (sujet_id,))
-        actions_rows = cur.fetchall()
+        # fetch actions for all sous-sujets and flatten (legacy behavior)
+        cur.execute("SELECT id FROM sous_sujet WHERE sujet_id=%s ORDER BY id ASC;", (sujet_id,))
+        ss_ids = [r[0] for r in cur.fetchall()]
 
         actions: List[ActionTreeItem] = []
-        for (action_id, task, responsible, due_date, status, product_line, plant_site) in actions_rows:
-            # Sous-actions
-            cur.execute("""
+        for ss_id in ss_ids:
+            cur.execute(
+                """
                 SELECT id, task, responsible, due_date, status, product_line, plant_site
-                FROM sous_action
-                WHERE action_id=%s
+                FROM action
+                WHERE id_sous_sujet=%s
                 ORDER BY id ASC;
-            """, (action_id,))
-            sous_rows = cur.fetchall()
+                """,
+                (ss_id,),
+            )
+            actions_rows = cur.fetchall()
 
-            sous_items: List[SousActionTreeItem] = []
-            for (sid, stask, sresp, sdue, sstatus, sprod, splant) in sous_rows:
-                # Sous-sous-actions
-                cur.execute("""
+            for (action_id, task, responsible, due_date, status, product_line, plant_site) in actions_rows:
+                # Sous-actions
+                cur.execute(
+                    """
                     SELECT id, task, responsible, due_date, status, product_line, plant_site
-                    FROM sous_sous_action
-                    WHERE sous_action_id=%s
+                    FROM sous_action
+                    WHERE action_id=%s
                     ORDER BY id ASC;
-                """, (sid,))
-                ssa_rows = cur.fetchall()
-                ssa_items = [
-                    SousSousActionTreeItem(
-                        sous_sous_action_id=r[0], task=r[1], responsible=r[2],
-                        due_date=str(r[3]), status=r[4], product_line=r[5], plant_site=r[6]
-                    ) for r in ssa_rows
-                ]
+                    """,
+                    (action_id,),
+                )
+                sous_rows = cur.fetchall()
 
-                sous_items.append(SousActionTreeItem(
-                    sous_action_id=sid, task=stask, responsible=sresp, due_date=str(sdue),
-                    status=sstatus, product_line=sprod, plant_site=splant,
-                    sous_sous_actions=ssa_items or None
-                ))
+                sous_items: List[SousActionTreeItem] = []
+                for (sid, stask, sresp, sdue, sstatus, sprod, splant) in sous_rows:
+                    # Sous-sous-actions
+                    cur.execute(
+                        """
+                        SELECT id, task, responsible, due_date, status, product_line, plant_site
+                        FROM sous_sous_action
+                        WHERE sous_action_id=%s
+                        ORDER BY id ASC;
+                        """,
+                        (sid,),
+                    )
+                    ssa_rows = cur.fetchall()
+                    ssa_items = [
+                        SousSousActionTreeItem(
+                            sous_sous_action_id=r[0],
+                            task=r[1],
+                            responsible=r[2],
+                            due_date=str(r[3]),
+                            status=r[4],
+                            product_line=r[5],
+                            plant_site=r[6],
+                        )
+                        for r in ssa_rows
+                    ]
 
-            actions.append(ActionTreeItem(
-                action_id=action_id, task=task, responsible=responsible,
-                due_date=str(due_date), status=status, product_line=product_line, plant_site=plant_site,
-                sous_actions=sous_items or None
-            ))
+                    sous_items.append(
+                        SousActionTreeItem(
+                            sous_action_id=sid,
+                            task=stask,
+                            responsible=sresp,
+                            due_date=str(sdue),
+                            status=sstatus,
+                            product_line=sprod,
+                            plant_site=splant,
+                            sous_sous_actions=ssa_items or None,
+                        )
+                    )
+
+                actions.append(
+                    ActionTreeItem(
+                        action_id=action_id,
+                        task=task,
+                        responsible=responsible,
+                        due_date=str(due_date),
+                        status=status,
+                        product_line=product_line,
+                        plant_site=plant_site,
+                        sous_actions=sous_items or None,
+                    )
+                )
 
         cur.close(); conn.close()
         return ActionsTreeOutResp(sujet_id=sujet_id, actions=actions)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# NEW: full tree by sujet (preferred)
+# ---------------------------
+@app.get("/tree/sujet", response_model=SujetTreeOut)
+def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (sujet_id,))
+        if cur.fetchone() is None:
+            cur.close(); conn.close()
+            raise HTTPException(status_code=404, detail="Sujet not found")
+
+        cur.execute(
+            """
+            SELECT id, titre
+            FROM sous_sujet
+            WHERE sujet_id=%s
+            ORDER BY id ASC;
+            """,
+            (sujet_id,),
+        )
+        ss_rows = cur.fetchall()
+
+        sous_sujets: List[SousSujetTreeItem] = []
+        for (ss_id, titre) in ss_rows:
+            cur.execute(
+                """
+                SELECT id, task, responsible, due_date, status, product_line, plant_site
+                FROM action
+                WHERE id_sous_sujet=%s
+                ORDER BY id ASC;
+                """,
+                (ss_id,),
+            )
+            actions_rows = cur.fetchall()
+
+            actions: List[ActionTreeItem] = []
+            for (action_id, task, responsible, due_date, status, product_line, plant_site) in actions_rows:
+                cur.execute(
+                    """
+                    SELECT id, task, responsible, due_date, status, product_line, plant_site
+                    FROM sous_action
+                    WHERE action_id=%s
+                    ORDER BY id ASC;
+                    """,
+                    (action_id,),
+                )
+                sous_rows = cur.fetchall()
+
+                sous_items: List[SousActionTreeItem] = []
+                for (sid, stask, sresp, sdue, sstatus, sprod, splant) in sous_rows:
+                    cur.execute(
+                        """
+                        SELECT id, task, responsible, due_date, status, product_line, plant_site
+                        FROM sous_sous_action
+                        WHERE sous_action_id=%s
+                        ORDER BY id ASC;
+                        """,
+                        (sid,),
+                    )
+                    ssa_rows = cur.fetchall()
+                    ssa_items = [
+                        SousSousActionTreeItem(
+                            sous_sous_action_id=r[0],
+                            task=r[1],
+                            responsible=r[2],
+                            due_date=str(r[3]),
+                            status=r[4],
+                            product_line=r[5],
+                            plant_site=r[6],
+                        )
+                        for r in ssa_rows
+                    ]
+
+                    sous_items.append(
+                        SousActionTreeItem(
+                            sous_action_id=sid,
+                            task=stask,
+                            responsible=sresp,
+                            due_date=str(sdue),
+                            status=sstatus,
+                            product_line=sprod,
+                            plant_site=splant,
+                            sous_sous_actions=ssa_items or None,
+                        )
+                    )
+
+                actions.append(
+                    ActionTreeItem(
+                        action_id=action_id,
+                        task=task,
+                        responsible=responsible,
+                        due_date=str(due_date),
+                        status=status,
+                        product_line=product_line,
+                        plant_site=plant_site,
+                        sous_actions=sous_items or None,
+                    )
+                )
+
+            sous_sujets.append(SousSujetTreeItem(sous_sujet_id=ss_id, titre=titre, actions=actions or None))
+
+        cur.close(); conn.close()
+        return SujetTreeOut(sujet_id=sujet_id, sous_sujets=sous_sujets)
     except HTTPException:
         raise
     except Exception as e:
