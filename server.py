@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, Query, Path
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import datetime
-from db import get_connection
+from db import get_connection , get_connection_1
 
 app = FastAPI(title="Conversation Logger API", version="1.5.0")
 
@@ -169,6 +169,31 @@ class SujetTreeOut(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "up"}
+
+
+# ---------------------------
+# NEW: Generic recursive actions (v2, db secondaire)
+# ---------------------------
+class ActionV2In(BaseModel):
+    task: str
+    responsible: str
+    due_date: str  # YYYY-MM-DD
+    status: str = "nouvelle"
+    product_line: Optional[str] = None
+    plant_site: Optional[str] = None
+    children: Optional[List["ActionV2In"]] = None
+
+ActionV2In.model_rebuild()
+
+class ActionV2Out(BaseModel):
+    id: int
+    task: str
+    responsible: str
+    due_date: str
+    status: str
+    product_line: Optional[str] = None
+    plant_site: Optional[str] = None
+    children: Optional[List["ActionV2Out"]] = None
 
 # ---------------------------
 # Save conversation
@@ -761,3 +786,105 @@ def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# NEW: Recursive Actions on DB secondaire (via get_connection_1)
+# ---------------------------
+
+def _insert_action_recursive(cur, parent_id: Optional[int], sous_sujet_id: int, node: ActionV2In) -> int:
+    cur.execute(
+        """
+        INSERT INTO action (id_sous_sujet, parent_action_id, task, responsible, due_date, status, product_line, plant_site)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id;
+        """,
+        (sous_sujet_id, parent_id, node.task, node.responsible, node.due_date,
+         node.status, node.product_line, node.plant_site),
+    )
+    new_id = cur.fetchone()[0]
+
+    if node.children:
+        for child in node.children:
+            _insert_action_recursive(cur, new_id, sous_sujet_id, child)
+
+    return new_id
+
+@app.post("/v2/actions/tree", response_model=ActionV2Out)
+def create_action_tree_v2(sous_sujet_id: int = Query(..., ge=1), root: ActionV2In = ...):
+    """
+    Ajoute une action (et ses sous-actions récursives) dans la DB secondaire.
+    """
+    try:
+        conn = get_connection_1()
+        cur = conn.cursor()
+        # Vérifie que le sous-sujet existe
+        cur.execute("SELECT 1 FROM sous_sujet WHERE id=%s;", (sous_sujet_id,))
+        if cur.fetchone() is None:
+            cur.close(); conn.close()
+            raise HTTPException(status_code=404, detail="Sous-sujet not found")
+
+        root_id = _insert_action_recursive(cur, None, sous_sujet_id, root)
+        conn.commit()
+
+        cur.close(); conn.close()
+        return ActionV2Out(
+            id=root_id,
+            task=root.task,
+            responsible=root.responsible,
+            due_date=root.due_date,
+            status=root.status,
+            product_line=root.product_line,
+            plant_site=root.plant_site,
+            children=root.children or None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Insertion failed (DB2): {e}")
+
+
+@app.get("/v2/actions/tree", response_model=List[ActionV2Out])
+def get_actions_tree_v2(sous_sujet_id: int = Query(..., ge=1)):
+    """
+    Récupère l’arbre d’actions récursif pour un sous-sujet depuis la DB secondaire.
+    """
+    try:
+        conn = get_connection_1()
+        cur = conn.cursor()
+
+        def fetch_children(parent_id: Optional[int]) -> List[ActionV2Out]:
+            if parent_id is None:
+                cur.execute(
+                    "SELECT id, task, responsible, due_date, status, product_line, plant_site "
+                    "FROM action WHERE id_sous_sujet=%s AND parent_action_id IS NULL ORDER BY id;",
+                    (sous_sujet_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, task, responsible, due_date, status, product_line, plant_site "
+                    "FROM action WHERE parent_action_id=%s ORDER BY id;",
+                    (parent_id,),
+                )
+            rows = cur.fetchall()
+            items: List[ActionV2Out] = []
+            for (aid, task, resp, due, status, prod, plant) in rows:
+                children = fetch_children(aid)
+                items.append(
+                    ActionV2Out(
+                        id=aid,
+                        task=task,
+                        responsible=resp,
+                        due_date=str(due),
+                        status=status,
+                        product_line=prod,
+                        plant_site=plant,
+                        children=children or None,
+                    )
+                )
+            return items
+
+        root_actions = fetch_children(None)
+        cur.close(); conn.close()
+        return root_actions
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed (DB2): {e}")
