@@ -820,17 +820,31 @@ def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
 # ---------------------------
 # NEW: Recursive Subjects on DB secondaire (via get_connection_1)
 # ---------------------------
-# --- helper insert récursif sujets
-def _insert_sujet_recursive(cur, parent_id: Optional[int], node: SujetNodeIn) -> int:
+# --- helper insert récursif sujets -> retourne SujetNodeOut (avec IDs)
+def _insert_sujet_recursive(cur, parent_id: Optional[int], node: SujetNodeIn) -> SujetNodeOut:
+    titre = (node.titre or "").strip()
+    if not titre:
+        raise HTTPException(status_code=422, detail="Field 'titre' is required")
+
     cur.execute("""
         INSERT INTO sujet (parent_sujet_id, code, titre, description)
         VALUES (%s,%s,%s,%s)
         RETURNING id;
-    """, (parent_id, node.code, node.titre.strip(), node.description))
+    """, (parent_id, node.code, titre, node.description))
     sid = cur.fetchone()[0]
+
+    children_out: List[SujetNodeOut] = []
     for ch in (node.children or []):
-        _insert_sujet_recursive(cur, sid, ch)
-    return sid
+        child_out = _insert_sujet_recursive(cur, sid, ch)
+        children_out.append(child_out)
+
+    return SujetNodeOut(
+        id=sid,
+        titre=titre,
+        description=node.description,
+        code=node.code,
+        children=children_out or None,
+    )
 
 # POST /v2/sujets/tree
 @app.post("/v2/sujets/tree", response_model=SujetNodeOut)
@@ -838,15 +852,8 @@ def create_sujet_tree_v2(root: SujetNodeIn):
     conn = get_connection_1()
     try:
         with conn, conn.cursor() as cur:
-            root_id = _insert_sujet_recursive(cur, None, root)
-            # On reconstruit la réponse simple à partir de l'input
-            return SujetNodeOut(
-                id=root_id,
-                titre=root.titre,
-                description=root.description,
-                code=root.code,
-                children=root.children or None,
-            )
+            root_out = _insert_sujet_recursive(cur, None, root)
+            return root_out                    # ✅ renvoie bien SujetNodeOut complet
     finally:
         conn.close()
 
@@ -904,8 +911,8 @@ def get_sujet_tree_v2(root_id: int = Query(..., ge=1)):
 # NEW: Recursive Actions on DB secondaire (via get_connection_1)
 # ---------------------------
 
-# --- helper insert récursif actions
-def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int, node: ActionV2In) -> int:
+# --- helper insert récursif actions -> retourne ActionV2Out (avec IDs)
+def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int, node: ActionV2In) -> ActionV2Out:
     cur.execute("""
         INSERT INTO action (sujet_id, parent_action_id, type, titre, description, responsable, due_date, statut)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -913,24 +920,34 @@ def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int
     """, (
         sujet_id,
         parent_action_id,
-        "action",                                 # défaut
+        "action",
         node.task.strip(),
-        None,                                     # description si tu en veux une
+        None,
         (node.responsible or None),
-        node.due_date,                            # date ou None
+        node.due_date,
         STATUS_MAP_APP_TO_DB.get(node.status, "nouveau"),
     ))
-    new_id = cur.fetchone()[0]
+    aid = cur.fetchone()[0]
+
+    children_out: List[ActionV2Out] = []
     for ch in (node.children or []):
-        _insert_action_recursive(cur, new_id, sujet_id, ch)
-    return new_id
+        child_out = _insert_action_recursive(cur, aid, sujet_id, ch)
+        children_out.append(child_out)
+
+    return ActionV2Out(
+        id=aid,
+        task=node.task,
+        responsible=node.responsible,
+        due_date=(node.due_date.isoformat() if node.due_date else None),
+        status=node.status,
+        product_line=node.product_line,
+        plant_site=node.plant_site,
+        children=children_out or None,
+    )
 
 # POST /v2/actions/tree?sujet_id=...
 @app.post("/v2/actions/tree", response_model=ActionV2Out)
 def create_action_tree_v2(sujet_id: int = Query(..., ge=1), root: ActionV2In = ...):
-    """
-    Ajoute une action (et ses sous-actions récursives) rattachées à un sujet (DB secondaire).
-    """
     conn = get_connection_1()
     try:
         with conn, conn.cursor() as cur:
@@ -938,18 +955,8 @@ def create_action_tree_v2(sujet_id: int = Query(..., ge=1), root: ActionV2In = .
             if cur.fetchone() is None:
                 raise HTTPException(status_code=404, detail="Sujet not found")
 
-            root_id = _insert_action_recursive(cur, None, sujet_id, root)
-
-            return ActionV2Out(
-                id=root_id,
-                task=root.task,
-                responsible=root.responsible,
-                due_date=(root.due_date.isoformat() if root.due_date else None),
-                status=root.status,
-                product_line=root.product_line,
-                plant_site=root.plant_site,
-                children=root.children or None,
-            )
+            root_out = _insert_action_recursive(cur, None, sujet_id, root)
+            return root_out                    # ✅ renvoie ActionV2Out (pas In)
     finally:
         conn.close()
 
