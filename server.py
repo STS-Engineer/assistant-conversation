@@ -818,103 +818,213 @@ def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
+# NEW: Recursive Subjects on DB secondaire (via get_connection_1)
+# ---------------------------
+# --- helper insert récursif sujets
+def _insert_sujet_recursive(cur, parent_id: Optional[int], node: SujetNodeIn) -> int:
+    cur.execute("""
+        INSERT INTO sujet (parent_sujet_id, code, titre, description)
+        VALUES (%s,%s,%s,%s)
+        RETURNING id;
+    """, (parent_id, node.code, node.titre.strip(), node.description))
+    sid = cur.fetchone()[0]
+    for ch in (node.children or []):
+        _insert_sujet_recursive(cur, sid, ch)
+    return sid
+
+# POST /v2/sujets/tree
+@app.post("/v2/sujets/tree", response_model=SujetNodeOut)
+def create_sujet_tree_v2(root: SujetNodeIn):
+    conn = get_connection_1()
+    try:
+        with conn, conn.cursor() as cur:
+            root_id = _insert_sujet_recursive(cur, None, root)
+            # On reconstruit la réponse simple à partir de l'input
+            return SujetNodeOut(
+                id=root_id,
+                titre=root.titre,
+                description=root.description,
+                code=root.code,
+                children=root.children or None,
+            )
+    finally:
+        conn.close()
+
+# GET /v2/sujets/tree?root_id=...
+@app.get("/v2/sujets/tree", response_model=SujetNodeOut)
+def get_sujet_tree_v2(root_id: int = Query(..., ge=1)):
+    conn = get_connection_1()
+    try:
+        with conn, conn.cursor() as cur:
+            # Vérifie racine
+            cur.execute("SELECT id, parent_sujet_id, code, titre, description FROM sujet WHERE id=%s;", (root_id,))
+            head = cur.fetchone()
+            if not head:
+                raise HTTPException(status_code=404, detail="Sujet root not found")
+
+            # Récupère tout le sous-arbre en 1 requête
+            cur.execute("""
+                WITH RECURSIVE tree AS (
+                  SELECT id, parent_sujet_id, code, titre, description
+                  FROM sujet
+                  WHERE id = %s
+                  UNION ALL
+                  SELECT s.id, s.parent_sujet_id, s.code, s.titre, s.description
+                  FROM sujet s
+                  JOIN tree t ON s.parent_sujet_id = t.id
+                )
+                SELECT id, parent_sujet_id, code, titre, description
+                FROM tree ORDER BY id;
+            """, (root_id,))
+            rows = cur.fetchall()
+
+        # Reconstruit l'arbre en mémoire
+        by_parent = {}
+        def mk(r):
+            sid, parent, code, titre, desc = r
+            return SujetNodeOut(id=sid, titre=titre, description=desc, code=code, children=[])
+        for r in rows:
+            sid, parent, *_ = r
+            by_parent.setdefault(parent, []).append(mk(r))
+
+        def attach(node: SujetNodeOut):
+            for ch in by_parent.get(node.id, []):
+                node.children.append(ch); attach(ch)
+            if not node.children:
+                node.children = None
+
+        # noeud racine
+        root = mk(head)
+        attach(root)
+        return root
+    finally:
+        conn.close()
+
+# ---------------------------
 # NEW: Recursive Actions on DB secondaire (via get_connection_1)
 # ---------------------------
 
-def _insert_action_recursive(cur, parent_id: Optional[int], sous_sujet_id: int, node: ActionV2In) -> int:
-    cur.execute(
-        """
-        INSERT INTO action (id_sous_sujet, parent_action_id, task, responsible, due_date, status, product_line, plant_site)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+# --- helper insert récursif actions
+def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int, node: ActionV2In) -> int:
+    cur.execute("""
+        INSERT INTO action (sujet_id, parent_action_id, type, titre, description, responsable, due_date, statut)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
-        """,
-        (sous_sujet_id, parent_id, node.task, node.responsible, node.due_date,
-         node.status, node.product_line, node.plant_site),
-    )
+    """, (
+        sujet_id,
+        parent_action_id,
+        "action",                                 # défaut
+        node.task.strip(),
+        None,                                     # description si tu en veux une
+        (node.responsible or None),
+        node.due_date,                            # date ou None
+        STATUS_MAP_APP_TO_DB.get(node.status, "nouveau"),
+    ))
     new_id = cur.fetchone()[0]
-
-    if node.children:
-        for child in node.children:
-            _insert_action_recursive(cur, new_id, sous_sujet_id, child)
-
+    for ch in (node.children or []):
+        _insert_action_recursive(cur, new_id, sujet_id, ch)
     return new_id
 
+# POST /v2/actions/tree?sujet_id=...
 @app.post("/v2/actions/tree", response_model=ActionV2Out)
-def create_action_tree_v2(sous_sujet_id: int = Query(..., ge=1), root: ActionV2In = ...):
+def create_action_tree_v2(sujet_id: int = Query(..., ge=1), root: ActionV2In = ...):
     """
-    Ajoute une action (et ses sous-actions récursives) dans la DB secondaire.
+    Ajoute une action (et ses sous-actions récursives) rattachées à un sujet (DB secondaire).
     """
+    conn = get_connection_1()
     try:
-        conn = get_connection_1()
-        cur = conn.cursor()
-        # Vérifie que le sous-sujet existe
-        cur.execute("SELECT 1 FROM sous_sujet WHERE id=%s;", (sous_sujet_id,))
-        if cur.fetchone() is None:
-            cur.close(); conn.close()
-            raise HTTPException(status_code=404, detail="Sous-sujet not found")
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (sujet_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Sujet not found")
 
-        root_id = _insert_action_recursive(cur, None, sous_sujet_id, root)
-        conn.commit()
+            root_id = _insert_action_recursive(cur, None, sujet_id, root)
 
-        cur.close(); conn.close()
-        return ActionV2Out(
-            id=root_id,
-            task=root.task,
-            responsible=root.responsible,
-            due_date=root.due_date,
-            status=root.status,
-            product_line=root.product_line,
-            plant_site=root.plant_site,
-            children=root.children or None,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Insertion failed (DB2): {e}")
+            return ActionV2Out(
+                id=root_id,
+                task=root.task,
+                responsible=root.responsible,
+                due_date=(root.due_date.isoformat() if root.due_date else None),
+                status=root.status,
+                product_line=root.product_line,
+                plant_site=root.plant_site,
+                children=root.children or None,
+            )
+    finally:
+        conn.close()
 
-
+# GET /v2/actions/tree?sujet_id=...
 @app.get("/v2/actions/tree", response_model=List[ActionV2Out])
-def get_actions_tree_v2(sous_sujet_id: int = Query(..., ge=1)):
+def get_actions_tree_v2(sujet_id: int = Query(..., ge=1)):
     """
-    Récupère l’arbre d’actions récursif pour un sous-sujet depuis la DB secondaire.
+    Récupère l’arbre d’actions récursif pour un sujet (DB secondaire).
     """
+    conn = get_connection_1()
     try:
-        conn = get_connection_1()
-        cur = conn.cursor()
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (sujet_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Sujet not found")
 
-        def fetch_children(parent_id: Optional[int]) -> List[ActionV2Out]:
-            if parent_id is None:
-                cur.execute(
-                    "SELECT id, task, responsible, due_date, status, product_line, plant_site "
-                    "FROM action WHERE id_sous_sujet=%s AND parent_action_id IS NULL ORDER BY id;",
-                    (sous_sujet_id,),
-                )
-            else:
-                cur.execute(
-                    "SELECT id, task, responsible, due_date, status, product_line, plant_site "
-                    "FROM action WHERE parent_action_id=%s ORDER BY id;",
-                    (parent_id,),
-                )
+            # Un seul SELECT (pas de N+1)
+            cur.execute("""
+                SELECT id, parent_action_id, type, titre, description, responsable, due_date, statut
+                FROM action
+                WHERE sujet_id=%s
+                ORDER BY id;
+            """, (sujet_id,))
             rows = cur.fetchall()
-            items: List[ActionV2Out] = []
-            for (aid, task, resp, due, status, prod, plant) in rows:
-                children = fetch_children(aid)
-                items.append(
-                    ActionV2Out(
-                        id=aid,
-                        task=task,
-                        responsible=resp,
-                        due_date=str(due),
-                        status=status,
-                        product_line=prod,
-                        plant_site=plant,
-                        children=children or None,
-                    )
-                )
-            return items
 
-        root_actions = fetch_children(None)
-        cur.close(); conn.close()
-        return root_actions
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query failed (DB2): {e}")
+        by_parent = {}
+        def mk(r) -> ActionV2Out:
+            aid, parent, type_, titre, descr, resp, due, statut = r
+            return ActionV2Out(
+                id=aid,
+                task=titre,
+                responsible=resp,
+                due_date=(str(due) if due is not None else None),
+                status=statut,
+                product_line=None,
+                plant_site=None,
+                children=[],
+            )
+        for r in rows:
+            aid, parent, *_ = r
+            by_parent.setdefault(parent, []).append(mk(r))
+
+        def attach(node: ActionV2Out):
+            for ch in by_parent.get(node.id, []):
+                node.children.append(ch); attach(ch)
+            if not node.children:
+                node.children = None
+
+        roots: List[ActionV2Out] = []
+        for root in by_parent.get(None, []):
+            attach(root); roots.append(root)
+        return roots
+    finally:
+        conn.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
