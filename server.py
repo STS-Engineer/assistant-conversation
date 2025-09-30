@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException, Query, Path
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
-from datetime import datetime
+from datetime import datetime , date
 from db import get_connection , get_connection_1
 
 app = FastAPI(title="Conversation Logger API", version="1.5.0")
@@ -170,15 +170,35 @@ class SujetTreeOut(BaseModel):
 def health():
     return {"status": "up"}
 
+# ---------------------------
+# Models (SUJETS RÉCURSIFS)
+# ---------------------------
+class SujetNodeIn(BaseModel):
+    titre: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    code: Optional[str] = None
+    children: Optional[List["SujetNodeIn"]] = None
+
+SujetNodeIn.model_rebuild()
+
+class SujetNodeOut(BaseModel):
+    id: int
+    titre: str
+    description: Optional[str] = None
+    code: Optional[str] = None
+    children: Optional[List["SujetNodeOut"]] = None
 
 # ---------------------------
-# NEW: Generic recursive actions (v2, db secondaire)
+# Models (ACTIONS RÉCURSIVES)
 # ---------------------------
+Status = Literal["nouvelle","en_cours","bloquee","terminee","annulee"]
+
 class ActionV2In(BaseModel):
-    task: str
-    responsible: str
-    due_date: str  # YYYY-MM-DD
-    status: str = "nouvelle"
+    task: str = Field(..., min_length=1)
+    responsible: Optional[str] = None
+    due_date: Optional[date] = None     # conseillé: vraie date
+    status: Status = "nouvelle"
+    # facultatifs (pas en DB2, gardés si ton app les utilise côté front)
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
     children: Optional[List["ActionV2In"]] = None
@@ -188,13 +208,23 @@ ActionV2In.model_rebuild()
 class ActionV2Out(BaseModel):
     id: int
     task: str
-    responsible: str
-    due_date: str
+    responsible: Optional[str] = None
+    due_date: Optional[str] = None
     status: str
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
     children: Optional[List["ActionV2Out"]] = None
 
+# ---------------------------
+# Mapping status app -> DB
+# ---------------------------
+STATUS_MAP_APP_TO_DB = {
+    "nouvelle": "nouveau",
+    "en_cours": "en_cours",
+    "bloquee": "bloque",
+    "terminee": "termine",
+    "annulee": "termine",  # ou élargis la CHECK pour accepter 'annulee'
+}
 # ---------------------------
 # Save conversation
 # ---------------------------
