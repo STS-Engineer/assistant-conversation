@@ -2,13 +2,12 @@
 from fastapi import FastAPI, HTTPException, Query, Path
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
-from datetime import datetime , date
-from db import get_connection , get_connection_1
+from datetime import datetime, date
+from db import get_connection, get_connection_1
 import base64, binascii
-
 from fastapi.responses import Response, PlainTextResponse
 
-app = FastAPI(title="Conversation Logger API", version="1.7.0")
+app = FastAPI(title="Conversation Logger API", version="1.8.0")
 
 # ---------------------------
 # Models (conversations)
@@ -17,21 +16,20 @@ class ConversationIn(BaseModel):
     user_name: str = Field(..., min_length=1, max_length=200)
     conversation: str = Field(..., min_length=1)
     date_conversation: Optional[datetime] = None
-    # NEW (methode 2): image binaire en base ------------------------------------------------
-    # image_base64 : contenu b64 (pas l'URL) ; optionnel
+    # Image binaire (optionnelle) : encodée en base64 côté API
     image_base64: Optional[str] = Field(
         default=None,
-        description="Image encodée en base64 (corps binaire)",
+        description="Image encodée en base64 (laisser null/omise si pas d'image)"
     )
     image_mime: Optional[str] = Field(
         default=None,
-        description="MIME type de l'image (ex: image/png, image/jpeg)",
         max_length=100,
+        description="MIME type (ex: image/png). Ignoré si image_base64 absente/vides."
     )
     image_filename: Optional[str] = Field(
         default=None,
-        description="Nom de fichier proposé au téléchargement",
         max_length=255,
+        description="Nom de fichier proposé au téléchargement."
     )
 
 class ConversationOut(BaseModel):
@@ -49,7 +47,7 @@ class ConversationDetail(BaseModel):
     user_name: str
     date_conversation: datetime
     conversation: str
-    # NEW: on expose des métadonnées, pas l'image binaire
+    # Métadonnées image (on ne renvoie jamais le binaire ici)
     has_image: bool
     image_mime: Optional[str] = None
     image_filename: Optional[str] = None
@@ -93,13 +91,13 @@ class SousSujetSummary(BaseModel):
 # ---------------------------
 # Models (actions tree)
 # ---------------------------
-Status = Literal["nouvelle", "en_cours", "bloquee", "terminee", "annulee"]
+StatusEnum = Literal["nouvelle", "en_cours", "bloquee", "terminee", "annulee"]
 
 class SousSousActionNodeIn(BaseModel):
     task: str
     responsible: str
     due_date: str  # YYYY-MM-DD
-    status: Status = "nouvelle"
+    status: StatusEnum = "nouvelle"
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
 
@@ -107,7 +105,7 @@ class SousActionNodeIn(BaseModel):
     task: str
     responsible: str
     due_date: str
-    status: Status = "nouvelle"
+    status: StatusEnum = "nouvelle"
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
     sous_sous_actions: Optional[List[SousSousActionNodeIn]] = None
@@ -116,13 +114,13 @@ class ActionNodeIn(BaseModel):
     task: str
     responsible: str
     due_date: str
-    status: Status = "nouvelle"
+    status: StatusEnum = "nouvelle"
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
     sous_actions: Optional[List[SousActionNodeIn]] = None
 
-# CHANGED: payload now expects sous_sujet_id (not sujet_id)
 class ActionsBulkIn(BaseModel):
+    # CHANGEMENT déjà présent chez vous: on utilise le sous_sujet_id
     sous_sujet_id: int = Field(..., ge=1)
     actions: List[ActionNodeIn]
 
@@ -138,7 +136,7 @@ class ActionNodeOut(BaseModel):
     sous_actions: Optional[List[SousActionNodeOut]] = None
 
 class ActionsBulkOut(BaseModel):
-    # kept for compatibility; we return parent sujet_id for context
+    # pour contexte de réponse
     sujet_id: int
     created: List[ActionNodeOut]
 
@@ -214,14 +212,11 @@ class SujetNodeOut(BaseModel):
 # ---------------------------
 # Models (ACTIONS RÉCURSIVES)
 # ---------------------------
-Status = Literal["nouvelle","en_cours","bloquee","terminee","annulee"]
-
 class ActionV2In(BaseModel):
     task: str = Field(..., min_length=1)
     responsible: Optional[str] = None
-    due_date: Optional[date] = None     # conseillé: vraie date
-    status: Status = "nouvelle"
-    # facultatifs (pas en DB2, gardés si ton app les utilise côté front)
+    due_date: Optional[date] = None
+    status: StatusEnum = "nouvelle"
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
     children: Optional[List["ActionV2In"]] = None
@@ -246,34 +241,45 @@ STATUS_MAP_APP_TO_DB = {
     "en_cours": "en_cours",
     "bloquee": "bloque",
     "terminee": "termine",
-    "annulee": "termine",  # ou élargis la CHECK pour accepter 'annulee'
+    "annulee": "termine",  # ou étendre le CHECK pour accepter annulee
 }
 
 # ---------------------------
-# Save conversation
+# Save conversation (avec image BYTEA optionnelle)
 # ---------------------------
 @app.post("/save-conversation", response_model=ConversationOut)
 def save_conversation(payload: ConversationIn):
     """
-    Accepte une image en base64 (optionnelle). On la stocke en BYTEA (image_data),
-    plus image_mime et image_filename si fournis.
+    Accepte une image encodée base64 (optionnelle). Si image_base64 est null/""/"null"/"none",
+    on l'ignore proprement. Stockage en BYTEA (image_data) + image_mime + image_filename.
     """
     try:
         conn = get_connection()
         cur = conn.cursor()
         date_conv = payload.date_conversation or datetime.utcnow()
 
+        # Normalisation & validation base64
         image_bytes = None
-        if payload.image_base64:
+        raw_b64 = payload.image_base64
+
+        if isinstance(raw_b64, str):
+            s = raw_b64.strip()
+            if s == "" or s.lower() in ("null", "none"):
+                raw_b64 = None
+
+        if raw_b64:
             try:
-                # Sécurisé: validate=True rejette les chars non base64
-                image_bytes = base64.b64decode(payload.image_base64, validate=True)
+                image_bytes = base64.b64decode(raw_b64, validate=True)
             except (binascii.Error, ValueError):
                 raise HTTPException(status_code=422, detail="image_base64 is not valid base64")
 
-            # (Optionnel) limite applicative 10 Mo
+            # Limite applicative 10 Mo
             if len(image_bytes) > 10 * 1024 * 1024:
                 raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
+        else:
+            # Pas d'image -> on neutralise les métadonnées si fournies
+            payload.image_mime = None
+            payload.image_filename = None
 
         cur.execute(
             """
@@ -343,7 +349,7 @@ def list_conversations(
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# Get conversation by id (sans l'image binaire)
+# Get conversation by id (renvoie métadonnées image)
 # ---------------------------
 @app.get("/conversations/{id}", response_model=ConversationDetail)
 def get_conversation_by_id(id: int = Path(..., ge=1)):
@@ -378,14 +384,14 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# Download image (binaire)
+# Download image (flux binaire)
 # ---------------------------
 @app.get("/conversations/{id}/image")
 def download_conversation_image(id: int = Path(..., ge=1)):
     """
     Renvoie l'image binaire si présente.
     Content-Type = image_mime (ou application/octet-stream)
-    Content-Disposition = attachment; filename="<image_filename>" (si défini)
+    Content-Disposition = attachment; filename="<image_filename>" si défini.
     """
     try:
         conn = get_connection()
