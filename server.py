@@ -1,11 +1,13 @@
 # server.py
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, HTTPException, Query, Path, File, UploadFile, Form
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
-from datetime import datetime
-from db import get_connection
+from datetime import datetime, date
+from db import get_connection, get_connection_1
+import base64
 
-app = FastAPI(title="Conversation Logger API", version="1.5.0")
+app = FastAPI(title="Conversation Logger API", version="1.6.0")
 
 # ---------------------------
 # Models (conversations)
@@ -14,6 +16,7 @@ class ConversationIn(BaseModel):
     user_name: str = Field(..., min_length=1, max_length=200)
     conversation: str = Field(..., min_length=1)
     date_conversation: Optional[datetime] = None
+    image_base64: Optional[str] = None  # Image en base64
 
 class ConversationOut(BaseModel):
     id: int
@@ -24,12 +27,14 @@ class ConversationSummary(BaseModel):
     user_name: str
     date_conversation: datetime
     preview: str
+    has_image: bool = False
 
 class ConversationDetail(BaseModel):
     id: int
     user_name: str
     date_conversation: datetime
     conversation: str
+    has_image: bool = False
 
 # ---------------------------
 # Models (sujet)
@@ -98,7 +103,6 @@ class ActionNodeIn(BaseModel):
     plant_site: Optional[str] = None
     sous_actions: Optional[List[SousActionNodeIn]] = None
 
-# CHANGED: payload now expects sous_sujet_id (not sujet_id)
 class ActionsBulkIn(BaseModel):
     sous_sujet_id: int = Field(..., ge=1)
     actions: List[ActionNodeIn]
@@ -115,7 +119,6 @@ class ActionNodeOut(BaseModel):
     sous_actions: Optional[List[SousActionNodeOut]] = None
 
 class ActionsBulkOut(BaseModel):
-    # kept for compatibility; we return parent sujet_id for context
     sujet_id: int
     created: List[ActionNodeOut]
 
@@ -148,12 +151,10 @@ class ActionTreeItem(BaseModel):
     plant_site: Optional[str] = None
     sous_actions: Optional[List[SousActionTreeItem]] = None
 
-# legacy response for GET /actions?sujet_id=...
 class ActionsTreeOut(BaseModel):
     sujet_id: int
     actions: List[ActionTreeItem]
 
-# NEW: tree by sujet including sous-sujets
 class SousSujetTreeItem(BaseModel):
     sous_sujet_id: int
     titre: str
@@ -171,7 +172,60 @@ def health():
     return {"status": "up"}
 
 # ---------------------------
-# Save conversation
+# Models (SUJETS RÉCURSIFS)
+# ---------------------------
+class SujetNodeIn(BaseModel):
+    titre: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    code: Optional[str] = None
+    children: Optional[List["SujetNodeIn"]] = None
+
+SujetNodeIn.model_rebuild()
+
+class SujetNodeOut(BaseModel):
+    id: int
+    titre: str
+    description: Optional[str] = None
+    code: Optional[str] = None
+    children: Optional[List["SujetNodeOut"]] = None
+
+# ---------------------------
+# Models (ACTIONS RÉCURSIVES)
+# ---------------------------
+class ActionV2In(BaseModel):
+    task: str = Field(..., min_length=1)
+    responsible: Optional[str] = None
+    due_date: Optional[date] = None
+    status: Status = "nouvelle"
+    product_line: Optional[str] = None
+    plant_site: Optional[str] = None
+    children: Optional[List["ActionV2In"]] = None
+
+ActionV2In.model_rebuild()
+
+class ActionV2Out(BaseModel):
+    id: int
+    task: str
+    responsible: Optional[str] = None
+    due_date: Optional[str] = None
+    status: str
+    product_line: Optional[str] = None
+    plant_site: Optional[str] = None
+    children: Optional[List["ActionV2Out"]] = None
+
+# ---------------------------
+# Mapping status app -> DB
+# ---------------------------
+STATUS_MAP_APP_TO_DB = {
+    "nouvelle": "nouveau",
+    "en_cours": "en_cours",
+    "bloquee": "bloque",
+    "terminee": "termine",
+    "annulee": "termine",
+}
+
+# ---------------------------
+# Save conversation (with optional image)
 # ---------------------------
 @app.post("/save-conversation", response_model=ConversationOut)
 def save_conversation(payload: ConversationIn):
@@ -179,23 +233,109 @@ def save_conversation(payload: ConversationIn):
         conn = get_connection()
         cur = conn.cursor()
         date_conv = payload.date_conversation or datetime.utcnow()
+        
+        # Décoder l'image base64 si présente
+        image_bytes = None
+        if payload.image_base64:
+            try:
+                # Retirer le préfixe data:image/...;base64, si présent
+                if ',' in payload.image_base64:
+                    payload.image_base64 = payload.image_base64.split(',')[1]
+                image_bytes = base64.b64decode(payload.image_base64)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Image base64 invalide: {e}")
+        
         cur.execute(
             """
-            INSERT INTO conversations (user_name, conversation, date_conversation)
-            VALUES (%s, %s, %s)
+            INSERT INTO conversations (user_name, conversation, date_conversation, image)
+            VALUES (%s, %s, %s, %s)
             RETURNING id;
             """,
-            (payload.user_name.strip(), payload.conversation, date_conv),
+            (payload.user_name.strip(), payload.conversation, date_conv, image_bytes),
         )
         new_id = cur.fetchone()[0]
         conn.commit()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return ConversationOut(id=new_id)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Insertion échouée: {e}")
 
 # ---------------------------
-# List conversations
+# NEW: Upload image for existing conversation
+# ---------------------------
+@app.post("/conversations/{id}/upload-image")
+async def upload_conversation_image(
+    id: int = Path(..., ge=1),
+    file: UploadFile = File(...)
+):
+    try:
+        # Vérifier le type MIME
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="Le fichier doit être une image")
+        
+        # Lire l'image
+        image_bytes = await file.read()
+        
+        # Limiter la taille (ex: 5MB)
+        if len(image_bytes) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="L'image ne doit pas dépasser 5MB")
+        
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Vérifier que la conversation existe
+        cur.execute("SELECT 1 FROM conversations WHERE id=%s;", (id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Mettre à jour l'image
+        cur.execute(
+            "UPDATE conversations SET image = %s WHERE id = %s;",
+            (image_bytes, id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return {"status": "ok", "message": "Image uploaded successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+# ---------------------------
+# NEW: Get conversation image
+# ---------------------------
+@app.get("/conversations/{id}/image")
+def get_conversation_image(id: int = Path(..., ge=1)):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT image FROM conversations WHERE id=%s;", (id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        if not row[0]:
+            raise HTTPException(status_code=404, detail="No image found for this conversation")
+        
+        # Retourner l'image avec le bon type MIME
+        return Response(content=row[0], media_type="image/jpeg")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# List conversations (updated with has_image)
 # ---------------------------
 @app.get("/conversations")
 def list_conversations(
@@ -217,7 +357,7 @@ def list_conversations(
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         cur.execute(
             f"""
-            SELECT id, user_name, date_conversation, conversation
+            SELECT id, user_name, date_conversation, conversation, (image IS NOT NULL) as has_image
             FROM conversations
             {where_sql}
             ORDER BY date_conversation DESC, id DESC
@@ -229,16 +369,23 @@ def list_conversations(
         cur.execute(f"SELECT COUNT(*) FROM conversations {where_sql};", tuple(params))
         total = cur.fetchone()[0]
         items: List[ConversationSummary] = []
-        for (cid, uname, dconv, conv) in rows:
+        for (cid, uname, dconv, conv, has_img) in rows:
             preview = conv[:140]
-            items.append(ConversationSummary(id=cid, user_name=uname, date_conversation=dconv, preview=preview))
-        cur.close(); conn.close()
+            items.append(ConversationSummary(
+                id=cid, 
+                user_name=uname, 
+                date_conversation=dconv, 
+                preview=preview,
+                has_image=has_img
+            ))
+        cur.close()
+        conn.close()
         return {"items": items, "total": total}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# Get conversation by id
+# Get conversation by id (updated with has_image)
 # ---------------------------
 @app.get("/conversations/{id}", response_model=ConversationDetail)
 def get_conversation_by_id(id: int = Path(..., ge=1)):
@@ -247,16 +394,23 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, user_name, date_conversation, conversation
+            SELECT id, user_name, date_conversation, conversation, (image IS NOT NULL) as has_image
             FROM conversations WHERE id=%s;
             """,
             (id,),
         )
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        return ConversationDetail(id=row[0], user_name=row[1], date_conversation=row[2], conversation=row[3])
+        return ConversationDetail(
+            id=row[0], 
+            user_name=row[1], 
+            date_conversation=row[2], 
+            conversation=row[3],
+            has_image=row[4]
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -273,7 +427,8 @@ def export_conversation_txt(id: int = Path(..., ge=1)):
         cur = conn.cursor()
         cur.execute("SELECT conversation FROM conversations WHERE id=%s;", (id,))
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
         txt = row[0].replace(" , ", "\n")
@@ -293,10 +448,10 @@ def create_sujet(payload: SujetIn):
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM conversations WHERE id=%s;", (payload.conversation_id,))
         if cur.fetchone() is None:
-            cur.close(); conn.close()
+            cur.close()
+            conn.close()
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        # one subject per conversation (return existing if same text)
         cur.execute(
             """
             SELECT id FROM sujet
@@ -308,7 +463,8 @@ def create_sujet(payload: SujetIn):
         if existing:
             cur.execute("SELECT id, conversation_id, sujet, created_at FROM sujet WHERE id=%s;", (existing[0],))
             s = cur.fetchone()
-            cur.close(); conn.close()
+            cur.close()
+            conn.close()
             return SujetOut(id=s[0], conversation_id=s[1], sujet=s[2], created_at=s[3])
 
         cur.execute(
@@ -321,7 +477,8 @@ def create_sujet(payload: SujetIn):
         )
         s = cur.fetchone()
         conn.commit()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return SujetOut(id=s[0], conversation_id=s[1], sujet=s[2], created_at=s[3])
     except HTTPException:
         raise
@@ -356,7 +513,8 @@ def list_sujets(
         cur.execute(f"SELECT COUNT(*) FROM sujet {where_sql};", tuple(params))
         total = cur.fetchone()[0]
         items = [SujetSummary(id=r[0], conversation_id=r[1], sujet=r[2]) for r in rows]
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return {"items": items, "total": total}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
@@ -368,7 +526,8 @@ def list_sujets_by_conversation(id: int = Path(..., ge=1)):
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM conversations WHERE id=%s;", (id,))
         if cur.fetchone() is None:
-            cur.close(); conn.close()
+            cur.close()
+            conn.close()
             raise HTTPException(status_code=404, detail="Conversation not found")
         cur.execute(
             """
@@ -380,7 +539,8 @@ def list_sujets_by_conversation(id: int = Path(..., ge=1)):
             (id,),
         )
         rows = cur.fetchall()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return [SujetOut(id=r[0], conversation_id=r[1], sujet=r[2], created_at=r[3]) for r in rows]
     except HTTPException:
         raise
@@ -400,7 +560,8 @@ def get_sujet_by_id(id: int = Path(..., ge=1)):
             (id,),
         )
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Sujet not found")
         return SujetOut(id=row[0], conversation_id=row[1], sujet=row[2], created_at=row[3])
@@ -419,7 +580,8 @@ def create_sous_sujet(payload: SousSujetIn):
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (payload.sujet_id,))
         if cur.fetchone() is None:
-            cur.close(); conn.close()
+            cur.close()
+            conn.close()
             raise HTTPException(status_code=404, detail="Sujet not found")
 
         cur.execute(
@@ -432,7 +594,8 @@ def create_sous_sujet(payload: SousSujetIn):
         )
         r = cur.fetchone()
         conn.commit()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return SousSujetOut(id=r[0], sujet_id=r[1], titre=r[2], created_at=r[3])
     except HTTPException:
         raise
@@ -467,10 +630,14 @@ def list_sous_sujets(
         cur.execute(f"SELECT COUNT(*) FROM sous_sujet {where_sql};", tuple(params))
         total = cur.fetchone()[0]
         items = [SousSujetSummary(id=r[0], sujet_id=r[1], titre=r[2]) for r in rows]
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return {"items": items, "total": total}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# [Le reste du code reste identique - actions/bulk, tree, etc.]
+# ... (continuez avec le reste de votre code existant)
 
 # ---------------------------
 # ACTIONS (bulk insert) via sous_sujet_id
