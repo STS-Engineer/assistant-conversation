@@ -16,3 +16,18 @@ def get_connection():
         password="$#fKcdXPg4@ue8AW",  # mot de passe de l'utilisateur PostgreSQL
         sslmode="require"  # obligatoire sur Azure
     )
+
+def get_connection_1():
+    """
+    Connexion au deuxième serveur PostgreSQL .
+    """
+    return psycopg2.connect(
+        host="avo-adb-002.postgres.database.azure.com",
+        port=5432,
+        database="Action Plan",
+        user="administrationSTS",
+        password="St$@0987",
+        sslmode="require"
+    )
+
+
