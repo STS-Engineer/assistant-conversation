@@ -261,6 +261,8 @@ def save_conversation(payload: ConversationIn):
 def list_conversations(
     date: Optional[str] = Query(None, description="YYYY-MM-DD (UTC)"),
     user_name: Optional[str] = None,
+    client_name: Optional[str] = None,
+    assistant_name: Optional[str] = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -274,6 +276,12 @@ def list_conversations(
         if user_name:
             where.append("LOWER(user_name) LIKE %s")
             params.append(f"%{user_name.lower()}%")
+        if client_name:
+            where.append("client_name = %s")
+            params.append(client_name)
+        if assistant_name:
+            where.append("assistant_name = %s")
+            params.append(assistant_name)
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         cur.execute(
             f"""
