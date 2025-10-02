@@ -360,13 +360,13 @@ def get_conversations_by_client(
 
         items = []
         total = 0
-        for (cid, uname, suj, cname, dconv, conv, tot) in rows:
+        for (cid, uname, aname, cname, dconv, conv, tot) in rows:
             total = tot  # identique pour toutes les lignes
             preview = (conv[:160] + "…") if isinstance(conv, str) and len(conv) > 160 else conv
             items.append({
                 "id": cid,
                 "user_name": uname,
-                "sujet": suj,
+                "assistant_name": aname,
                 "client_name": cname,
                 "date_conversation": dconv,
                 "preview": preview,
@@ -376,6 +376,7 @@ def get_conversations_by_client(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
 # ---------------------------
 # Export TXT
 # ---------------------------
