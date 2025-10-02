@@ -277,9 +277,11 @@ def list_conversations(
             where.append("LOWER(user_name) LIKE %s")
             params.append(f"%{user_name.lower()}%")
         if client_name:
-            where.append("client_name = %s")
-            params.append(client_name)
+            # CHANGED: case-insensitive partial match on client_name
+            where.append("LOWER(client_name) LIKE %s")
+            params.append(f"%{client_name.lower()}%")
         if assistant_name:
+            # (optionnel) tu peux aussi rendre assistant_name insensible à la casse
             where.append("assistant_name = %s")
             params.append(assistant_name)
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
@@ -331,7 +333,7 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# Get all conversations by client_name
+# Get all conversations by client_name (case-insensitive LIKE)
 # ---------------------------
 @app.get("/conversations/client/{client_name}")
 def get_conversations_by_client(
@@ -460,7 +462,7 @@ def list_sujets(
         cur.execute(
             f"""
             SELECT id, conversation_id, sujet, created_at
-            FROM sujet
+            FROM sous_sujet
             {where_sql}
             ORDER BY created_at DESC, id DESC
             LIMIT %s OFFSET %s;
@@ -468,9 +470,9 @@ def list_sujets(
             (*params, limit, offset),
         )
         rows = cur.fetchall()
-        cur.execute(f"SELECT COUNT(*) FROM sujet {where_sql};", tuple(params))
+        cur.execute(f"SELECT COUNT(*) FROM sous_sujet {where_sql};", tuple(params))
         total = cur.fetchone()[0]
-        items = [SujetSummary(id=r[0], conversation_id=r[1], sujet=r[2]) for r in rows]
+        items = [SousSujetSummary(id=r[0], sujet_id=r[1], titre=r[2]) for r in rows]
         cur.close(); conn.close()
         return {"items": items, "total": total}
     except Exception as e:
@@ -881,6 +883,7 @@ def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
 # NEW: Recursive Subjects on DB secondaire (via get_connection_1)
 # ---------------------------
 # --- helper insert récursif sujets -> retourne SujetNodeOut (avec IDs)
+
 def _insert_sujet_recursive(cur, parent_id: Optional[int], node: SujetNodeIn) -> SujetNodeOut:
     titre = (node.titre or "").strip()
     if not titre:
@@ -971,6 +974,7 @@ def get_sujet_tree_v2(root_id: int = Query(..., ge=1)):
 # NEW: Recursive Actions on DB secondaire (via get_connection_1)
 # ---------------------------
 # --- helper insert récursif actions -> retourne ActionV2Out (avec IDs)
+
 def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int, node: ActionV2In) -> ActionV2Out:
     cur.execute("""
         INSERT INTO action (sujet_id, parent_action_id, type, titre, description, responsable, due_date, statut)
