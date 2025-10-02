@@ -14,6 +14,8 @@ class ConversationIn(BaseModel):
     user_name: str = Field(..., min_length=1, max_length=200)
     conversation: str = Field(..., min_length=1)
     date_conversation: Optional[datetime] = None
+    client_name: Optional[str] = None
+    assistant_name: Optional[str] = None
 
 class ConversationOut(BaseModel):
     id: int
@@ -24,12 +26,16 @@ class ConversationSummary(BaseModel):
     user_name: str
     date_conversation: datetime
     preview: str
+    client_name: Optional[str] = None
+    assistant_name: Optional[str] = None
 
 class ConversationDetail(BaseModel):
     id: int
     user_name: str
     date_conversation: datetime
     conversation: str
+    client_name: Optional[str] = None
+    assistant_name: Optional[str] = None
 
 # ---------------------------
 # Models (sujet)
@@ -235,11 +241,11 @@ def save_conversation(payload: ConversationIn):
         date_conv = payload.date_conversation or datetime.utcnow()
         cur.execute(
             """
-            INSERT INTO conversations (user_name, conversation, date_conversation)
-            VALUES (%s, %s, %s)
+            INSERT INTO conversations (user_name, conversation, date_conversation, client_name, assistant_name)
+            VALUES (%s, %s, %s, %s, %s)
             RETURNING id;
             """,
-            (payload.user_name.strip(), payload.conversation, date_conv),
+            (payload.user_name.strip(), payload.conversation, date_conv, payload.client_name, payload.assistant_name),
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -271,7 +277,7 @@ def list_conversations(
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         cur.execute(
             f"""
-            SELECT id, user_name, date_conversation, conversation
+            SELECT id, user_name, date_conversation, conversation, client_name, assistant_name
             FROM conversations
             {where_sql}
             ORDER BY date_conversation DESC, id DESC
@@ -283,9 +289,9 @@ def list_conversations(
         cur.execute(f"SELECT COUNT(*) FROM conversations {where_sql};", tuple(params))
         total = cur.fetchone()[0]
         items: List[ConversationSummary] = []
-        for (cid, uname, dconv, conv) in rows:
+        for (cid, uname, dconv, conv, cname, aname) in rows:
             preview = conv[:140]
-            items.append(ConversationSummary(id=cid, user_name=uname, date_conversation=dconv, preview=preview))
+            items.append(ConversationSummary(id=cid, user_name=uname, date_conversation=dconv, preview=preview, client_name=cname, assistant_name=aname))
         cur.close(); conn.close()
         return {"items": items, "total": total}
     except Exception as e:
@@ -301,7 +307,7 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, user_name, date_conversation, conversation
+            SELECT id, user_name, date_conversation, conversation, client_name, assistant_name
             FROM conversations WHERE id=%s;
             """,
             (id,),
@@ -310,9 +316,32 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
         cur.close(); conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        return ConversationDetail(id=row[0], user_name=row[1], date_conversation=row[2], conversation=row[3])
+        return ConversationDetail(id=row[0], user_name=row[1], date_conversation=row[2], conversation=row[3], client_name=row[4], assistant_name=row[5])
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# Get all conversations by client_name
+# ---------------------------
+@app.get("/conversations/client/{client_name}", response_model=List[ConversationDetail])
+def get_conversations_by_client(client_name: str = Path(..., min_length=1)):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, user_name, date_conversation, conversation, client_name, assistant_name
+            FROM conversations
+            WHERE client_name = %s
+            ORDER BY date_conversation DESC, id DESC;
+            """,
+            (client_name,),
+        )
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        return [ConversationDetail(id=r[0], user_name=r[1], date_conversation=r[2], conversation=r[3], client_name=r[4], assistant_name=r[5]) for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
