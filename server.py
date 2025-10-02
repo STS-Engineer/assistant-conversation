@@ -333,26 +333,49 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
 # ---------------------------
 # Get all conversations by client_name
 # ---------------------------
-@app.get("/conversations/client/{client_name}", response_model=List[ConversationDetail])
-def get_conversations_by_client(client_name: str = Path(..., min_length=1)):
+@app.get("/conversations/client/{client_name}")
+def get_conversations_by_client(
+    client_name: str = Path(..., min_length=1),
+):
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, user_name, date_conversation, conversation, client_name, assistant_name
-            FROM conversations
-            WHERE client_name = %s
-            ORDER BY date_conversation DESC, id DESC;
-            """,
-            (client_name,),
-        )
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-        return [ConversationDetail(id=r[0], user_name=r[1], date_conversation=r[2], conversation=r[3], client_name=r[4], assistant_name=r[5]) for r in rows]
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        user_name,
+                        sujet,
+                        client_name,
+                        date_conversation,
+                        conversation,
+                        COUNT(*) OVER() AS total_count
+                    FROM conversations
+                    WHERE LOWER(client_name) LIKE %s
+                    ORDER BY date_conversation DESC, id DESC;
+                    """,
+                    (f"%{client_name.lower()}%",),
+                )
+                rows = cur.fetchall()
+
+        items = []
+        total = 0
+        for (cid, uname, suj, cname, dconv, conv, tot) in rows:
+            total = tot  # identique pour toutes les lignes
+            preview = (conv[:160] + "…") if isinstance(conv, str) and len(conv) > 160 else conv
+            items.append({
+                "id": cid,
+                "user_name": uname,
+                "sujet": suj,
+                "client_name": cname,
+                "date_conversation": dconv,
+                "preview": preview,
+            })
+
+        return {"items": items, "total": total if rows else 0}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
-
 # ---------------------------
 # Export TXT
 # ---------------------------
