@@ -345,7 +345,7 @@ def get_conversations_by_client(
                     SELECT
                         id,
                         user_name,
-                        sujet,
+                        assistant_name,
                         client_name,
                         date_conversation,
                         conversation,
