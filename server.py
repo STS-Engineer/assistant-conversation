@@ -196,13 +196,13 @@ class SujetNodeOut(BaseModel):
 # ---------------------------
 # Models (ACTIONS RÉCURSIVES)
 # ---------------------------
-Status = Literal["nouvelle","en_cours","bloquee","terminee","annulee"]
+Status = Literal["new", "in_progress", "blocked", "completed", "cancelled"] 
 
 class ActionV2In(BaseModel):
     task: str = Field(..., min_length=1)
     responsible: Optional[str] = None
     due_date: Optional[date] = None     # conseillé: vraie date
-    status: Status = "nouvelle"
+    status: Status = "new"
     # facultatifs (pas en DB2, gardés si ton app les utilise côté front)
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
@@ -215,21 +215,12 @@ class ActionV2Out(BaseModel):
     task: str
     responsible: Optional[str] = None
     due_date: Optional[str] = None
-    status: str
+    status: Literal["new", "in_progress", "blocked", "completed", "cancelled", "overdue"]
     product_line: Optional[str] = None
     plant_site: Optional[str] = None
     children: Optional[List["ActionV2Out"]] = None
 
-# ---------------------------
-# Mapping status app -> DB
-# ---------------------------
-STATUS_MAP_APP_TO_DB = {
-    "nouvelle": "nouveau",
-    "en_cours": "en_cours",
-    "bloquee": "bloque",
-    "terminee": "termine",
-    "annulee": "termine",  # ou élargis la CHECK pour accepter 'annulee'
-}
+
 # ---------------------------
 # Save conversation
 # ---------------------------
@@ -977,9 +968,9 @@ def get_sujet_tree_v2(root_id: int = Query(..., ge=1)):
 
 def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int, node: ActionV2In) -> ActionV2Out:
     cur.execute("""
-        INSERT INTO action (sujet_id, parent_action_id, type, titre, description, responsable, due_date, statut)
+        INSERT INTO action (sujet_id, parent_action_id, type, titre, description, responsable, due_date, status)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id;
+        RETURNING id, status;
     """, (
         sujet_id,
         parent_action_id,
@@ -988,9 +979,10 @@ def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int
         None,
         (node.responsible or None),
         node.due_date,
-        STATUS_MAP_APP_TO_DB.get(node.status, "nouveau"),
+        node.status,
     ))
-    aid = cur.fetchone()[0]
+    # Récupérer l'ID ET le statut final
+    aid, final_status = cur.fetchone() 
 
     children_out: List[ActionV2Out] = []
     for ch in (node.children or []):
@@ -1002,7 +994,7 @@ def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int
         task=node.task,
         responsible=node.responsible,
         due_date=(node.due_date.isoformat() if node.due_date else None),
-        status=node.status,
+        status=final_status,
         product_line=node.product_line,
         plant_site=node.plant_site,
         children=children_out or None,
@@ -1038,7 +1030,7 @@ def get_actions_tree_v2(sujet_id: int = Query(..., ge=1)):
 
             # Un seul SELECT (pas de N+1)
             cur.execute("""
-                SELECT id, parent_action_id, type, titre, description, responsable, due_date, statut
+                SELECT id, parent_action_id, type, titre, description, responsable, due_date, status
                 FROM action
                 WHERE sujet_id=%s
                 ORDER BY id;
@@ -1047,13 +1039,13 @@ def get_actions_tree_v2(sujet_id: int = Query(..., ge=1)):
 
         by_parent = {}
         def mk(r) -> ActionV2Out:
-            aid, parent, type_, titre, descr, resp, due, statut = r
+            aid, parent, type_, titre, descr, resp, due, status = r
             return ActionV2Out(
                 id=aid,
                 task=titre,
                 responsible=resp,
                 due_date=(str(due) if due is not None else None),
-                status=statut,
+                status=status,
                 product_line=None,
                 plant_site=None,
                 children=[],
