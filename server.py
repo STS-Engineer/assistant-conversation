@@ -1066,3 +1066,106 @@ def get_actions_tree_v2(sujet_id: int = Query(..., ge=1)):
         return roots
     finally:
         conn.close()
+
+
+
+@app.get("/v2/process_details", response_model=ProcessDetailsOut)
+def get_full_process_details(sujet_id: int = Query(..., ge=1)):
+    """
+    Récupère un Sujet (y compris les Sous-Sujets) et toutes les Actions 
+    arborescentes qui y sont liées en une seule requête pour l'Assistant IA.
+    """
+    conn = get_connection_1()
+    try:
+        # 1. Récupérer l'arbre des Sujets (en utilisant la logique de get_sujet_tree_v2)
+        with conn.cursor() as cur:
+            # -- Logique de get_sujet_tree_v2 (simplifiée pour l'appel interne) --
+            
+            # Récupère tout le sous-arbre des sujets en 1 requête (comme dans get_sujet_tree_v2)
+            cur.execute("""
+                WITH RECURSIVE tree AS (
+                    SELECT id, parent_sujet_id, code, titre, description, created_at, updated_at
+                    FROM sujet
+                    WHERE id = %s
+                    UNION ALL
+                    SELECT s.id, s.parent_sujet_id, s.code, s.titre, s.description, s.created_at, s.updated_at
+                    FROM sujet s
+                    JOIN tree t ON s.parent_sujet_id = t.id
+                )
+                SELECT id, parent_sujet_id, code, titre, description
+                FROM tree ORDER BY id;
+            """, (sujet_id,))
+            rows_sujet = cur.fetchall()
+
+        if not rows_sujet:
+             # Si la racine n'existe pas, on lève une 404
+             raise HTTPException(status_code=404, detail="Sujet root not found")
+
+        # Reconstruire l'arbre Sujet
+        by_parent_sujet = {}
+        def mk_sujet(r):
+            sid, parent, code, titre, desc = r
+            return SujetNodeOut(id=sid, titre=titre, description=desc, code=code, children=[])
+        
+        # Le premier élément est la tête si le ORDER BY est par ID
+        head_sujet = rows_sujet[0] 
+        for r in rows_sujet:
+            sid, parent, *_ = r
+            by_parent_sujet.setdefault(parent, []).append(mk_sujet(r))
+
+        def attach_sujet(node: SujetNodeOut):
+            for ch in by_parent_sujet.get(node.id, []):
+                node.children.append(ch); attach_sujet(ch)
+            if not node.children:
+                node.children = None
+
+        root_sujet = mk_sujet(head_sujet)
+        attach_sujet(root_sujet)
+
+        # 2. Récupérer l'arbre des Actions (en utilisant la logique de get_actions_tree_v2)
+        with conn.cursor() as cur:
+            # -- Logique de get_actions_tree_v2 --
+            cur.execute("""
+                SELECT id, parent_action_id, type, titre, description, responsable, due_date, status
+                FROM action
+                WHERE sujet_id=%s
+                ORDER BY id;
+            """, (sujet_id,))
+            rows_action = cur.fetchall()
+
+        # Reconstruire l'arbre Action (logique de get_actions_tree_v2)
+        by_parent_action = {}
+        def mk_action(r) -> ActionV2Out:
+            aid, parent, type_, titre, descr, resp, due, status = r
+            return ActionV2Out(
+                id=aid, task=titre, responsible=resp, due_date=(str(due) if due is not None else None),
+                status=status, product_line=None, plant_site=None, children=[],
+            )
+        for r in rows_action:
+            aid, parent, *_ = r
+            by_parent_action.setdefault(parent, []).append(mk_action(r))
+
+        def attach_action(node: ActionV2Out):
+            for ch in by_parent_action.get(node.id, []):
+                node.children.append(ch); attach_action(ch)
+            if not node.children:
+                node.children = None
+        
+        root_actions: List[ActionV2Out] = []
+        for root_act in by_parent_action.get(None, []):
+            attach_action(root_act); root_actions.append(root_act)
+
+
+        # 3. Combiner et retourner ProcessDetailsOut
+        return ProcessDetailsOut(
+            # Champs hérités de SujetNodeOut
+            id=root_sujet.id,
+            titre=root_sujet.titre,
+            description=root_sujet.description,
+            code=root_sujet.code,
+            children=root_sujet.children,
+            # Nouveau champ combiné
+            actions_tree=root_actions or None
+        )
+    finally:
+        conn.close()
