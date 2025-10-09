@@ -220,7 +220,14 @@ class ActionV2Out(BaseModel):
     plant_site: Optional[str] = None
     children: Optional[List["ActionV2Out"]] = None
 
-
+class ProcessDetailsOut(SujetNodeOut):
+    """
+    Modèle de sortie combinant un Sujet (héritage de SujetNodeOut) 
+    et l'arbre complet de ses Actions associées.
+    """
+    # L'arbre des actions (racines d'actions) associées à ce sujet
+    actions_tree: Optional[List[ActionV2Out]] = None 
+  
 # ---------------------------
 # Save conversation
 # ---------------------------
