@@ -220,6 +220,8 @@ class ActionV2Out(BaseModel):
     plant_site: Optional[str] = None
     children: Optional[List["ActionV2Out"]] = None
 
+ActionV2Out.model_rebuild()
+
 class ProcessDetailsOut(SujetNodeOut):
     """
     Modèle de sortie combinant un Sujet (héritage de SujetNodeOut) 
@@ -227,7 +229,8 @@ class ProcessDetailsOut(SujetNodeOut):
     """
     # L'arbre des actions (racines d'actions) associées à ce sujet
     actions_tree: Optional[List[ActionV2Out]] = None 
-  
+    
+ ProcessDetailsOut.model_rebuild() 
 # ---------------------------
 # Save conversation
 # ---------------------------
