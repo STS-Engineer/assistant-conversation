@@ -230,7 +230,7 @@ class ProcessDetailsOut(SujetNodeOut):
     # L'arbre des actions (racines d'actions) associées à ce sujet
     actions_tree: Optional[List[ActionV2Out]] = None 
     
- ProcessDetailsOut.model_rebuild() 
+ ProcessDetailsOut.model_rebuild()
 # ---------------------------
 # Save conversation
 # ---------------------------
