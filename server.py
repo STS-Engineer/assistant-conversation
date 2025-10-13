@@ -178,59 +178,58 @@ def health():
 # ---------------------------
 # Models (SUJETS RÉCURSIFS)
 # ---------------------------
-# class SujetNodeIn(BaseModel):
-#     titre: str = Field(..., min_length=1)
-#     description: Optional[str] = None
-#     code: Optional[str] = None
-#     children: Optional[List["SujetNodeIn"]] = None
+class SujetNodeIn(BaseModel):
+    titre: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    code: Optional[str] = None
+    children: Optional[List["SujetNodeIn"]] = None
 
-# SujetNodeIn.model_rebuild()
+SujetNodeIn.model_rebuild()
 
-# class SujetNodeOut(BaseModel):
-#     id: int
-#     titre: str
-#     description: Optional[str] = None
-#     code: Optional[str] = None
-#     children: Optional[List["SujetNodeOut"]] = None
+class SujetNodeOut(BaseModel):
+    id: int
+    titre: str
+    description: Optional[str] = None
+    code: Optional[str] = None
+    children: Optional[List["SujetNodeOut"]] = None
 
 # ---------------------------
 # Models (ACTIONS RÉCURSIVES)
 # ---------------------------
-# Status = Literal["new", "in_progress", "blocked", "completed", "cancelled"] 
+Status = Literal["nouvelle","en_cours","bloquee","terminee","annulee"]
 
-# class ActionV2In(BaseModel):
-#     task: str = Field(..., min_length=1)
-#     responsible: Optional[str] = None
-#     due_date: Optional[date] = None     # conseillé: vraie date
-#     status: Status = "new"
-#     # facultatifs (pas en DB2, gardés si ton app les utilise côté front)
-#     product_line: Optional[str] = None
-#     plant_site: Optional[str] = None
-#     children: Optional[List["ActionV2In"]] = None
+class ActionV2In(BaseModel):
+    task: str = Field(..., min_length=1)
+    responsible: Optional[str] = None
+    due_date: Optional[date] = None     # conseillé: vraie date
+    status: Status = "nouvelle"
+    # facultatifs (pas en DB2, gardés si ton app les utilise côté front)
+    product_line: Optional[str] = None
+    plant_site: Optional[str] = None
+    children: Optional[List["ActionV2In"]] = None
 
-# ActionV2In.model_rebuild()
+ActionV2In.model_rebuild()
 
-# class ActionV2Out(BaseModel):
-#     id: int
-#     task: str
-#     responsible: Optional[str] = None
-#     due_date: Optional[str] = None
-#     status: Literal["new", "in_progress", "blocked", "completed", "cancelled", "overdue"]
-#     product_line: Optional[str] = None
-#     plant_site: Optional[str] = None
-#     children: Optional[List["ActionV2Out"]] = None
+class ActionV2Out(BaseModel):
+    id: int
+    task: str
+    responsible: Optional[str] = None
+    due_date: Optional[str] = None
+    status: str
+    product_line: Optional[str] = None
+    plant_site: Optional[str] = None
+    children: Optional[List["ActionV2Out"]] = None
 
-# ActionV2Out.model_rebuild()
-
-# class ProcessDetailsOut(SujetNodeOut):
-#     """
-#     Modèle de sortie combinant un Sujet (héritage de SujetNodeOut) 
-#     et l'arbre complet de ses Actions associées.
-#     """
-#     # L'arbre des actions (racines d'actions) associées à ce sujet
-#     actions_tree: Optional[List[ActionV2Out]] = None 
-    
-#  ProcessDetailsOut.model_rebuild()
+# ---------------------------
+# Mapping status app -> DB
+# ---------------------------
+STATUS_MAP_APP_TO_DB = {
+    "nouvelle": "nouveau",
+    "en_cours": "en_cours",
+    "bloquee": "bloque",
+    "terminee": "termine",
+    "annulee": "termine",  # ou élargis la CHECK pour accepter 'annulee'
+}
 # ---------------------------
 # Save conversation
 # ---------------------------
@@ -880,11 +879,198 @@ def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
+# ---------------------------
+# NEW: Recursive Subjects on DB secondaire (via get_connection_1)
+# ---------------------------
+# --- helper insert récursif sujets -> retourne SujetNodeOut (avec IDs)
 
+def _insert_sujet_recursive(cur, parent_id: Optional[int], node: SujetNodeIn) -> SujetNodeOut:
+    titre = (node.titre or "").strip()
+    if not titre:
+        raise HTTPException(status_code=422, detail="Field 'titre' is required")
 
+    cur.execute("""
+        INSERT INTO sujet (parent_sujet_id, code, titre, description)
+        VALUES (%s,%s,%s,%s)
+        RETURNING id;
+    """, (parent_id, node.code, titre, node.description))
+    sid = cur.fetchone()[0]
 
+    children_out: List[SujetNodeOut] = []
+    for ch in (node.children or []):
+        child_out = _insert_sujet_recursive(cur, sid, ch)
+        children_out.append(child_out)
 
+    return SujetNodeOut(
+        id=sid,
+        titre=titre,
+        description=node.description,
+        code=node.code,
+        children=children_out or None,
+    )
 
+# POST /v2/sujets/tree
+@app.post("/v2/sujets/tree", response_model=SujetNodeOut)
+def create_sujet_tree_v2(root: SujetNodeIn):
+    conn = get_connection_1()
+    try:
+        with conn, conn.cursor() as cur:
+            root_out = _insert_sujet_recursive(cur, None, root)
+            return root_out                    # ✅ renvoie bien SujetNodeOut complet
+    finally:
+        conn.close()
 
+# GET /v2/sujets/tree?root_id=...
+@app.get("/v2/sujets/tree", response_model=SujetNodeOut)
+def get_sujet_tree_v2(root_id: int = Query(..., ge=1)):
+    conn = get_connection_1()
+    try:
+        with conn, conn.cursor() as cur:
+            # Vérifie racine
+            cur.execute("SELECT id, parent_sujet_id, code, titre, description FROM sujet WHERE id=%s;", (root_id,))
+            head = cur.fetchone()
+            if not head:
+                raise HTTPException(status_code=404, detail="Sujet root not found")
 
+            # Récupère tout le sous-arbre en 1 requête
+            cur.execute("""
+                WITH RECURSIVE tree AS (
+                  SELECT id, parent_sujet_id, code, titre, description
+                  FROM sujet
+                  WHERE id = %s
+                  UNION ALL
+                  SELECT s.id, s.parent_sujet_id, s.code, s.titre, s.description
+                  FROM sujet s
+                  JOIN tree t ON s.parent_sujet_id = t.id
+                )
+                SELECT id, parent_sujet_id, code, titre, description
+                FROM tree ORDER BY id;
+            """, (root_id,))
+            rows = cur.fetchall()
 
+        # Reconstruit l'arbre en mémoire
+        by_parent = {}
+        def mk(r):
+            sid, parent, code, titre, desc = r
+            return SujetNodeOut(id=sid, titre=titre, description=desc, code=code, children=[])
+        for r in rows:
+            sid, parent, *_ = r
+            by_parent.setdefault(parent, []).append(mk(r))
+
+        def attach(node: SujetNodeOut):
+            for ch in by_parent.get(node.id, []):
+                node.children.append(ch); attach(ch)
+            if not node.children:
+                node.children = None
+
+        # noeud racine
+        root = mk(head)
+        attach(root)
+        return root
+    finally:
+        conn.close()
+
+# ---------------------------
+# NEW: Recursive Actions on DB secondaire (via get_connection_1)
+# ---------------------------
+# --- helper insert récursif actions -> retourne ActionV2Out (avec IDs)
+
+def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int, node: ActionV2In) -> ActionV2Out:
+    cur.execute("""
+        INSERT INTO action (sujet_id, parent_action_id, type, titre, description, responsable, due_date, statut)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id;
+    """, (
+        sujet_id,
+        parent_action_id,
+        "action",
+        node.task.strip(),
+        None,
+        (node.responsible or None),
+        node.due_date,
+        STATUS_MAP_APP_TO_DB.get(node.status, "nouveau"),
+    ))
+    aid = cur.fetchone()[0]
+
+    children_out: List[ActionV2Out] = []
+    for ch in (node.children or []):
+        child_out = _insert_action_recursive(cur, aid, sujet_id, ch)
+        children_out.append(child_out)
+
+    return ActionV2Out(
+        id=aid,
+        task=node.task,
+        responsible=node.responsible,
+        due_date=(node.due_date.isoformat() if node.due_date else None),
+        status=node.status,
+        product_line=node.product_line,
+        plant_site=node.plant_site,
+        children=children_out or None,
+    )
+
+# POST /v2/actions/tree?sujet_id=...
+@app.post("/v2/actions/tree", response_model=ActionV2Out)
+def create_action_tree_v2(sujet_id: int = Query(..., ge=1), root: ActionV2In = ...):
+    conn = get_connection_1()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (sujet_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Sujet not found")
+
+            root_out = _insert_action_recursive(cur, None, sujet_id, root)
+            return root_out                    # ✅ renvoie ActionV2Out (pas In)
+    finally:
+        conn.close()
+
+# GET /v2/actions/tree?sujet_id=...
+@app.get("/v2/actions/tree", response_model=List[ActionV2Out])
+def get_actions_tree_v2(sujet_id: int = Query(..., ge=1)):
+    """
+    Récupère l’arbre d’actions récursif pour un sujet (DB secondaire).
+    """
+    conn = get_connection_1()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (sujet_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Sujet not found")
+
+            # Un seul SELECT (pas de N+1)
+            cur.execute("""
+                SELECT id, parent_action_id, type, titre, description, responsable, due_date, statut
+                FROM action
+                WHERE sujet_id=%s
+                ORDER BY id;
+            """, (sujet_id,))
+            rows = cur.fetchall()
+
+        by_parent = {}
+        def mk(r) -> ActionV2Out:
+            aid, parent, type_, titre, descr, resp, due, statut = r
+            return ActionV2Out(
+                id=aid,
+                task=titre,
+                responsible=resp,
+                due_date=(str(due) if due is not None else None),
+                status=statut,
+                product_line=None,
+                plant_site=None,
+                children=[],
+            )
+        for r in rows:
+            aid, parent, *_ = r
+            by_parent.setdefault(parent, []).append(mk(r))
+
+        def attach(node: ActionV2Out):
+            for ch in by_parent.get(node.id, []):
+                node.children.append(ch); attach(ch)
+            if not node.children:
+                node.children = None
+
+        roots: List[ActionV2Out] = []
+        for root in by_parent.get(None, []):
+            attach(root); roots.append(root)
+        return roots
+    finally:
+        conn.close()
