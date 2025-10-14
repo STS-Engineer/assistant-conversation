@@ -4,4 +4,4 @@ pydantic-core
 typing_extensions
 uvicorn[standard]
 gunicorn
-psycopg[binary]
+psycopg2-binary
