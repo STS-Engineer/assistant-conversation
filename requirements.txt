@@ -1,8 +1,4 @@
 fastapi
 uvicorn
-hypercorn
 psycopg2-binary
-python-dotenv
 pydantic
-gunicorn
-requests
