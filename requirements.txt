@@ -1,4 +1,6 @@
 fastapi
-uvicorn
-psycopg2-binary
 pydantic
+pydantic-core
+typing_extensions
+uvicorn[standard]
+gunicorn
