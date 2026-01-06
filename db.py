@@ -30,4 +30,15 @@ def get_connection_1():
         sslmode="require"
     )
 
-
+def get_connection_supplier():
+    """
+    Connexion au 3eme serveur PostgreSQL .
+    """
+     return psycopg2.connect(
+            host="avo-adb-001.postgres.database.azure.com",
+            port=5432,
+            database="conversation",
+            user="adminavo",  # utilisateur PostgreSQL, pas le compte Azure
+            password="$#fKcdXPg4@ue8AW",  # mot de passe de l'utilisateur PostgreSQL
+            sslmode="require"  # obligatoire sur Azure
+        )
