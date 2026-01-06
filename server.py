@@ -7,6 +7,37 @@ from db import get_connection , get_connection_1
 
 app = FastAPI(title="Conversation Logger API", version="1.5.0")
 
+
+
+
+
+class SupplierConversationIn(BaseModel):
+    user_name: str = Field(..., min_length=1, max_length=200)
+    conversation: str = Field(..., min_length=1)
+    date_conversation: Optional[datetime] = None
+    supplier_name: str = Field(..., min_length=1, max_length=255)
+    assistant_name: str = Field(..., min_length=1, max_length=255)
+
+class SupplierConversationOut(BaseModel):
+    id: int
+    status: str = "ok"
+
+class SupplierConversationSummary(BaseModel):
+    id: int
+    user_name: str
+    date_conversation: datetime
+    preview: str
+    supplier_name: str
+    assistant_name: str
+
+class SupplierConversationDetail(BaseModel):
+    id: int
+    user_name: str
+    date_conversation: datetime
+    conversation: str
+    supplier_name: str
+    assistant_name: str
+
 # ---------------------------
 # Models (conversations)
 # ---------------------------
@@ -1074,3 +1105,236 @@ def get_actions_tree_v2(sujet_id: int = Query(..., ge=1)):
         return roots
     finally:
         conn.close()
+
+
+
+
+# ---------------------------
+# NEW: Save Supplier Conversation
+# ---------------------------
+@app.post("/supplier/save-conversation", response_model=SupplierConversationOut)
+def save_supplier_conversation(payload: SupplierConversationIn):
+    """
+    Enregistre une conversation fournisseur dans la base supplier_conversation.
+    """
+    try:
+        from db import get_connection_supplier
+        conn = get_connection_supplier()
+        cur = conn.cursor()
+        date_conv = payload.date_conversation or datetime.utcnow()
+        
+        cur.execute(
+            """
+            INSERT INTO conversation (user_name, conversation, date_conversation, supplier_name, assistant_name)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                payload.user_name.strip(),
+                payload.conversation,
+                date_conv,
+                payload.supplier_name.strip(),
+                payload.assistant_name.strip()
+            ),
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        return SupplierConversationOut(id=new_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Insertion échouée: {e}")
+
+# ---------------------------
+# NEW: List Supplier Conversations
+# ---------------------------
+@app.get("/supplier/conversations")
+def list_supplier_conversations(
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (UTC)"),
+    user_name: Optional[str] = None,
+    supplier_name: Optional[str] = None,
+    assistant_name: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Liste les conversations fournisseurs avec filtres optionnels.
+    """
+    try:
+        from db import get_connection_supplier
+        conn = get_connection_supplier()
+        cur = conn.cursor()
+        where, params = [], []
+        
+        if date:
+            where.append("DATE(date_conversation AT TIME ZONE 'UTC') = %s")
+            params.append(date)
+        if user_name:
+            where.append("LOWER(user_name) LIKE %s")
+            params.append(f"%{user_name.lower()}%")
+        if supplier_name:
+            where.append("LOWER(supplier_name) LIKE %s")
+            params.append(f"%{supplier_name.lower()}%")
+        if assistant_name:
+            where.append("assistant_name = %s")
+            params.append(assistant_name)
+            
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        
+        cur.execute(
+            f"""
+            SELECT id, user_name, date_conversation, conversation, supplier_name, assistant_name
+            FROM conversation
+            {where_sql}
+            ORDER BY date_conversation DESC, id DESC
+            LIMIT %s OFFSET %s;
+            """,
+            (*params, limit, offset),
+        )
+        rows = cur.fetchall()
+        
+        cur.execute(f"SELECT COUNT(*) FROM conversation {where_sql};", tuple(params))
+        total = cur.fetchone()[0]
+        
+        items: List[SupplierConversationSummary] = []
+        for (cid, uname, dconv, conv, sname, aname) in rows:
+            preview = conv[:140]
+            items.append(
+                SupplierConversationSummary(
+                    id=cid,
+                    user_name=uname,
+                    date_conversation=dconv,
+                    preview=preview,
+                    supplier_name=sname,
+                    assistant_name=aname
+                )
+            )
+        
+        cur.close()
+        conn.close()
+        return {"items": items, "total": total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# NEW: Get Supplier Conversation by ID
+# ---------------------------
+@app.get("/supplier/conversations/{id}", response_model=SupplierConversationDetail)
+def get_supplier_conversation_by_id(id: int = Path(..., ge=1)):
+    """
+    Récupère une conversation fournisseur par ID.
+    """
+    try:
+        from db import get_connection_supplier
+        conn = get_connection_supplier()
+        cur = conn.cursor()
+        
+        cur.execute(
+            """
+            SELECT id, user_name, date_conversation, conversation, supplier_name, assistant_name
+            FROM conversation WHERE id=%s;
+            """,
+            (id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        return SupplierConversationDetail(
+            id=row[0],
+            user_name=row[1],
+            date_conversation=row[2],
+            conversation=row[3],
+            supplier_name=row[4],
+            assistant_name=row[5]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# NEW: Get Supplier Conversations by Supplier Name
+# ---------------------------
+@app.get("/supplier/conversations/supplier/{supplier_name}")
+def get_supplier_conversations_by_name(
+    supplier_name: str = Path(..., min_length=1),
+):
+    """
+    Récupère toutes les conversations d'un fournisseur spécifique.
+    """
+    try:
+        from db import get_connection_supplier
+        conn = get_connection_supplier()
+        cur = conn.cursor()
+        
+        cur.execute(
+            """
+            SELECT
+                id,
+                user_name,
+                assistant_name,
+                supplier_name,
+                date_conversation,
+                conversation,
+                COUNT(*) OVER() AS total_count
+            FROM conversation
+            WHERE LOWER(supplier_name) LIKE %s
+            ORDER BY date_conversation DESC, id DESC;
+            """,
+            (f"%{supplier_name.lower()}%",),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        items = []
+        total = 0
+        for (cid, uname, aname, sname, dconv, conv, tot) in rows:
+            total = tot
+            preview = (conv[:160] + "…") if isinstance(conv, str) and len(conv) > 160 else conv
+            items.append({
+                "id": cid,
+                "user_name": uname,
+                "assistant_name": aname,
+                "supplier_name": sname,
+                "date_conversation": dconv,
+                "preview": preview,
+            })
+
+        return {"items": items, "total": total if rows else 0}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+# ---------------------------
+# NEW: Export Supplier Conversation as TXT
+# ---------------------------
+@app.get("/supplier/conversations/{id}/export.txt", response_model=None)
+def export_supplier_conversation_txt(id: int = Path(..., ge=1)):
+    """
+    Exporte une conversation fournisseur en fichier texte.
+    """
+    try:
+        from fastapi.responses import PlainTextResponse
+        from db import get_connection_supplier
+        
+        conn = get_connection_supplier()
+        cur = conn.cursor()
+        cur.execute("SELECT conversation FROM conversation WHERE id=%s;", (id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        txt = row[0].replace(" , ", "\n")
+        return PlainTextResponse(content=txt, media_type="text/plain")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
