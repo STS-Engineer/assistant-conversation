@@ -12,14 +12,14 @@ def get_connection():
         host="avo-adb-001.postgres.database.azure.com",
         port=5432,
         database="Customer_IA",
-        user="adminavo",  # utilisateur PostgreSQL, pas le compte Azure
-        password="$#fKcdXPg4@ue8AW",  # mot de passe de l'utilisateur PostgreSQL
-        sslmode="require"  # obligatoire sur Azure
+        user="adminavo",
+        password="$#fKcdXPg4@ue8AW",
+        sslmode="require"
     )
 
 def get_connection_1():
     """
-    Connexion au deuxième serveur PostgreSQL .
+    Connexion au deuxième serveur PostgreSQL.
     """
     return psycopg2.connect(
         host="avo-adb-002.postgres.database.azure.com",
@@ -30,3 +30,15 @@ def get_connection_1():
         sslmode="require"
     )
 
+def get_connection_supplier():
+    """
+    Connexion à la base de données des conversations fournisseurs.
+    """
+    return psycopg2.connect(
+        host="avo-adb-001.postgres.database.azure.com",  # Ajustez si différent
+        port=5432,
+        database="supplier_conversation",
+        user="adminavo",  # Ajustez selon vos credentials
+        password="$#fKcdXPg4@ue8AW",  # Ajustez selon vos credentials
+        sslmode="require"
+    )
