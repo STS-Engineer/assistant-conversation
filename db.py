@@ -42,15 +42,3 @@ def get_connection_supplier():
         password="$#fKcdXPg4@ue8AW",  # Ajustez selon vos credentials
         sslmode="require"
     )
-def get_connection_Meeting():
-    """
-    Connexion à la base de données Meeting (conversations fournisseurs - meetings).
-    """
-    return psycopg2.connect(
-        host="avo-adb-002.postgres.database.azure.com"  # adapte si différent
-        port=5432,
-        database="Conversation_MeetingDB",
-        user="administrationSTS",
-        password="St$@0987",
-        sslmode="require"
-    )
