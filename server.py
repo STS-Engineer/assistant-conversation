@@ -3,12 +3,239 @@ from fastapi import FastAPI, HTTPException, Query, Path
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import datetime , date
-from db import get_connection , get_connection_1
+from db import get_connection , get_connection_1 , get_connection_Meeting 
 
 app = FastAPI(title="Conversation Logger API", version="1.5.0")
 
 
 
+class MeetingConversationIn(BaseModel):
+    user_name: str = Field(..., min_length=1, max_length=200)
+    conversation: str = Field(..., min_length=1)
+    date_conversation: Optional[datetime] = None
+    participants: str = Field(..., min_length=1, max_length=255)   # <-- بدل supplier_name
+    assistant_name: str = Field(..., min_length=1, max_length=255)
+
+class MeetingConversationOut(BaseModel):
+    id: int
+    status: str = "ok"
+
+class MeetingConversationSummary(BaseModel):
+    id: int
+    user_name: str
+    date_conversation: datetime
+    preview: str
+    participants: str
+    assistant_name: str
+
+class MeetingConversationDetail(BaseModel):
+    id: int
+    user_name: str
+    date_conversation: datetime
+    conversation: str
+    participants: str
+    assistant_name: str
+
+@app.post("/save-conversation_Meeting", response_model=MeetingConversationOut)
+def save_conversation_meeting(payload: MeetingConversationIn):
+    try:
+        from db import get_connection_Meeting
+        conn = get_connection_Meeting()
+        cur = conn.cursor()
+        date_conv = payload.date_conversation or datetime.utcnow()
+
+        cur.execute(
+            """
+            INSERT INTO conversation (user_name, conversation, date_conversation, participants, assistant_name)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                payload.user_name.strip(),
+                payload.conversation,
+                date_conv,
+                payload.participants.strip(),
+                payload.assistant_name.strip()
+            ),
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        return MeetingConversationOut(id=new_id)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Insertion échouée: {e}")
+
+@app.get("/conversations_Meeting")
+def list_conversations_meeting(
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (UTC)"),
+    user_name: Optional[str] = None,
+    participants: Optional[str] = None,
+    assistant_name: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        from db import get_connection_Meeting
+        conn = get_connection_Meeting()
+        cur = conn.cursor()
+        where, params = [], []
+
+        if date:
+            where.append("DATE(date_conversation AT TIME ZONE 'UTC') = %s")
+            params.append(date)
+        if user_name:
+            where.append("LOWER(user_name) LIKE %s")
+            params.append(f"%{user_name.lower()}%")
+        if participants:
+            where.append("LOWER(participants) LIKE %s")
+            params.append(f"%{participants.lower()}%")
+        if assistant_name:
+            where.append("assistant_name = %s")
+            params.append(assistant_name)
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        cur.execute(
+            f"""
+            SELECT id, user_name, date_conversation, conversation, participants, assistant_name
+            FROM conversation
+            {where_sql}
+            ORDER BY date_conversation DESC, id DESC
+            LIMIT %s OFFSET %s;
+            """,
+            (*params, limit, offset),
+        )
+        rows = cur.fetchall()
+
+        cur.execute(f"SELECT COUNT(*) FROM conversation {where_sql};", tuple(params))
+        total = cur.fetchone()[0]
+
+        items: List[MeetingConversationSummary] = []
+        for (cid, uname, dconv, conv, parts, aname) in rows:
+            preview = conv[:140]
+            items.append(
+                MeetingConversationSummary(
+                    id=cid,
+                    user_name=uname,
+                    date_conversation=dconv,
+                    preview=preview,
+                    participants=parts,
+                    assistant_name=aname
+                )
+            )
+
+        cur.close()
+        conn.close()
+        return {"items": items, "total": total}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+@app.get("/conversations/{id}_Meeting", response_model=MeetingConversationDetail)
+def get_conversation_by_id_meeting(id: int = Path(..., ge=1)):
+    try:
+        from db import get_connection_Meeting
+        conn = get_connection_Meeting()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id, user_name, date_conversation, conversation, participants, assistant_name
+            FROM conversation WHERE id=%s;
+            """,
+            (id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return MeetingConversationDetail(
+            id=row[0],
+            user_name=row[1],
+            date_conversation=row[2],
+            conversation=row[3],
+            participants=row[4],
+            assistant_name=row[5]
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+@app.get("/conversations/participants/{participants}_Meeting")
+def get_conversations_by_participants_meeting(
+    participants: str = Path(..., min_length=1),
+):
+    try:
+        from db import get_connection_Meeting
+        conn = get_connection_Meeting()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                id,
+                user_name,
+                assistant_name,
+                participants,
+                date_conversation,
+                conversation,
+                COUNT(*) OVER() AS total_count
+            FROM conversation
+            WHERE LOWER(participants) LIKE %s
+            ORDER BY date_conversation DESC, id DESC;
+            """,
+            (f"%{participants.lower()}%",),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        items = []
+        total = 0
+        for (cid, uname, aname, parts, dconv, conv, tot) in rows:
+            total = tot
+            preview = (conv[:160] + "…") if isinstance(conv, str) and len(conv) > 160 else conv
+            items.append({
+                "id": cid,
+                "user_name": uname,
+                "assistant_name": aname,
+                "participants": parts,
+                "date_conversation": dconv,
+                "preview": preview,
+            })
+
+        return {"items": items, "total": total if rows else 0}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+@app.get("/conversations/{id}/export.txt_Meeting", response_model=None)
+def export_conversation_txt_meeting(id: int = Path(..., ge=1)):
+    try:
+        from fastapi.responses import PlainTextResponse
+        from db import get_connection_Meeting
+
+        conn = get_connection_Meeting()
+        cur = conn.cursor()
+        cur.execute("SELECT conversation FROM conversation WHERE id=%s;", (id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        txt = row[0].replace(" , ", "\n")
+        return PlainTextResponse(content=txt, media_type="text/plain")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
 
 
 class SupplierConversationIn(BaseModel):
