@@ -46,14 +46,14 @@ def save_conversation_meeting(payload: MeetingConversationIn):
 
         cur.execute(
             """
-            INSERT INTO conversation (user_name, conversation, date_conversation, participants, assistant_name)
+            INSERT INTO conversation (date_conversation,user_name, conversation,  participants, assistant_name)
             VALUES (%s, %s, %s, %s, %s)
             RETURNING id;
             """,
             (
+                date_conv,
                 payload.user_name.strip(),
                 payload.conversation,
-                date_conv,
                 payload.participants.strip(),
                 payload.assistant_name.strip()
             ),
@@ -99,7 +99,7 @@ def list_conversations_meeting(
 
         cur.execute(
             f"""
-            SELECT id, user_name, date_conversation, conversation, participants, assistant_name
+            SELECT id,  date_conversation,user_name, conversation, participants, assistant_name
             FROM conversation
             {where_sql}
             ORDER BY date_conversation DESC, id DESC
@@ -118,8 +118,8 @@ def list_conversations_meeting(
             items.append(
                 MeetingConversationSummary(
                     id=cid,
-                    user_name=uname,
                     date_conversation=dconv,
+                    user_name=uname,
                     preview=preview,
                     participants=parts,
                     assistant_name=aname
@@ -141,7 +141,7 @@ def get_conversation_by_id_meeting(id: int = Path(..., ge=1)):
 
         cur.execute(
             """
-            SELECT id, user_name, date_conversation, conversation, participants, assistant_name
+            SELECT id, date_conversation, user_name, conversation, participants, assistant_name
             FROM conversation WHERE id=%s;
             """,
             (id,),
@@ -155,8 +155,8 @@ def get_conversation_by_id_meeting(id: int = Path(..., ge=1)):
 
         return MeetingConversationDetail(
             id=row[0],
-            user_name=row[1],
             date_conversation=row[2],
+            user_name=row[1],
             conversation=row[3],
             participants=row[4],
             assistant_name=row[5]
@@ -242,9 +242,9 @@ def health_meeting():
 
 
 class SupplierConversationIn(BaseModel):
+    date_conversation: Optional[datetime] = None
     user_name: str = Field(..., min_length=1, max_length=200)
     conversation: str = Field(..., min_length=1)
-    date_conversation: Optional[datetime] = None
     supplier_name: str = Field(..., min_length=1, max_length=255)
     assistant_name: str = Field(..., min_length=1, max_length=255)
 
@@ -254,16 +254,16 @@ class SupplierConversationOut(BaseModel):
 
 class SupplierConversationSummary(BaseModel):
     id: int
-    user_name: str
     date_conversation: datetime
+    user_name: str
     preview: str
     supplier_name: str
     assistant_name: str
 
 class SupplierConversationDetail(BaseModel):
     id: int
-    user_name: str
     date_conversation: datetime
+    user_name: str
     conversation: str
     supplier_name: str
     assistant_name: str
@@ -284,8 +284,8 @@ class ConversationOut(BaseModel):
 
 class ConversationSummary(BaseModel):
     id: int
-    user_name: str
     date_conversation: datetime
+    user_name: str
     preview: str
     client_name: Optional[str] = None
     assistant_name: Optional[str] = None
