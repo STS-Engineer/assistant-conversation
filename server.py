@@ -236,6 +236,9 @@ def export_conversation_txt_meeting(id: int = Path(..., ge=1)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+@app.get("/health_Meeting")
+def health_meeting():
+    return {"status": "up"}
 
 
 class SupplierConversationIn(BaseModel):
