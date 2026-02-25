@@ -9,11 +9,11 @@ def get_connection():
     Établit une connexion sécurisée avec PostgreSQL sur Azure.
     """
     return psycopg2.connect(
-        host="avo-adb-001.postgres.database.azure.com",
+        host="avo-adb-002.postgres.database.azure.com",
         port=5432,
-        database="Customer_IA",
-        user="adminavo",
-        password="$#fKcdXPg4@ue8AW",
+        database="Customer_DB",
+        user="administrationSTS",
+        password="St$@0987",
         sslmode="require"
     )
 
