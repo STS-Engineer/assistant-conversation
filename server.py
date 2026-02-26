@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Conversation Logger API", version="1.5.0")
 
 origins = [
-    "http://localhost:5173"
+    "https://meeting-minute-ia.azurewebsites.net"
 ]
 
 app.add_middleware(
