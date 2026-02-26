@@ -4,12 +4,21 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import datetime , date
 from db import get_connection , get_connection_1
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Conversation Logger API", version="1.5.0")
 
+origins = [
+    "http://localhost:5173"
+]
 
-
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class SupplierConversationIn(BaseModel):
     user_name: str = Field(..., min_length=1, max_length=200)
