@@ -97,10 +97,35 @@ async def list_plans(request: Request):
     return await _proxy("GET", "/api/v2/plans", request=request, params=params)
 
 
-@action_plan_router.get("/plans/{plan_id}")
-async def get_plan(plan_id: int, request: Request):
-    """GET -> GET {API}/api/v2/plans/{plan_id}."""
-    return await _proxy("GET", f"/api/v2/plans/{plan_id}", request=request)
+@action_plan_router.get("/plans/{sujet_id}")
+async def get_plan(sujet_id: int, request: Request):
+    """GET -> GET {API}/api/v2/plans/{sujet_id} (arbre complet d'un plan)."""
+    return await _proxy("GET", f"/api/v2/plans/{sujet_id}", request=request)
+
+
+@action_plan_router.post("/actions")
+async def create_action(request: Request):
+    """
+    POST -> POST {API}/api/v2/actions (ajoute UNE action à un sujet existant).
+    Corps attendu : { "sujet_id": int, "parent_action_id": int|null,
+    "titre": str, "status": "open"|"closed"|"blocked", "due_date": "YYYY-MM-DD", ... }
+    """
+    body = await request.json()
+    return await _proxy("POST", "/api/v2/actions", request=request, json_body=body)
+
+
+@action_plan_router.patch("/actions/{action_id}/status")
+async def update_action_status(action_id: int, request: Request):
+    """PATCH -> PATCH {API}/api/v2/actions/{id}/status. Corps : { "status": "open|closed|blocked" }."""
+    body = await request.json()
+    return await _proxy("PATCH", f"/api/v2/actions/{action_id}/status",
+                        request=request, json_body=body)
+
+
+@action_plan_router.get("/schema")
+async def get_schema(request: Request):
+    """GET -> GET {API}/api/v2/schema (format attendu + exemple de payload)."""
+    return await _proxy("GET", "/api/v2/schema", request=request)
 
 
 @action_plan_router.get("/_ping")
