@@ -55,6 +55,23 @@ def _forward_headers(request: Request) -> dict:
     return out
 
 
+async def _read_json_body(request: Request) -> Any:
+    """
+    Lit le corps JSON de façon robuste.
+    Corps vide ou JSON invalide -> HTTP 400 clair (au lieu d'une 500 brute).
+    """
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400,
+                            detail="Corps de requête vide : un JSON est attendu.")
+    import json as _json
+    try:
+        return _json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400,
+                            detail="Corps de requête invalide : JSON mal formé.")
+
+
 async def _proxy(method: str, path: str, *, request: Request,
                  json_body: Any = None, params: dict = None):
     """Appelle l'API externe et renvoie son JSON (ou propage son erreur)."""
@@ -86,7 +103,7 @@ async def _proxy(method: str, path: str, *, request: Request,
 @action_plan_router.post("/plans")
 async def create_plan(request: Request):
     """POST -> POST {API}/api/v2/plans (corps JSON transmis tel quel)."""
-    body = await request.json()
+    body = await _read_json_body(request)
     return await _proxy("POST", "/api/v2/plans", request=request, json_body=body)
 
 
@@ -110,14 +127,14 @@ async def create_action(request: Request):
     Corps attendu : { "sujet_id": int, "parent_action_id": int|null,
     "titre": str, "status": "open"|"closed"|"blocked", "due_date": "YYYY-MM-DD", ... }
     """
-    body = await request.json()
+    body = await _read_json_body(request)
     return await _proxy("POST", "/api/v2/actions", request=request, json_body=body)
 
 
 @action_plan_router.patch("/actions/{action_id}/status")
 async def update_action_status(action_id: int, request: Request):
     """PATCH -> PATCH {API}/api/v2/actions/{id}/status. Corps : { "status": "open|closed|blocked" }."""
-    body = await request.json()
+    body = await _read_json_body(request)
     return await _proxy("PATCH", f"/api/v2/actions/{action_id}/status",
                         request=request, json_body=body)
 
