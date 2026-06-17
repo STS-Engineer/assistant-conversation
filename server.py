@@ -1,12 +1,16 @@
 # server.py
-from fastapi import FastAPI, HTTPException, Query, Path
+import os
+from typing import Any, Optional, List, Literal
+from datetime import datetime, date
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Path, Request, APIRouter
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal
-from datetime import datetime , date
-from db import get_connection , get_connection_1
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Conversation Logger API", version="1.5.0")
+from db import get_connection
+
+app = FastAPI(title="Conversation Logger API", version="1.6.0")
 
 origins = [
     "https://meeting-minute-ia.azurewebsites.net"
@@ -20,6 +24,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ===========================================================================
+# PROXY ACTION PLAN  ->  API externe
+#   https://sales-feedback.azurewebsites.net
+#
+# Remplace les anciennes routes /v2/... qui écrivaient directement dans la
+# base "Action Plan". Ici on ne fait que relayer les requêtes HTTP : le corps
+# JSON du front est transmis tel quel, la réponse de l'API externe est renvoyée
+# sans transformation. Pas besoin de connaître le format exact du payload.
+# ===========================================================================
+
+ACTION_PLAN_API_BASE = os.environ.get(
+    "ACTION_PLAN_API_BASE",
+    "https://sales-feedback.azurewebsites.net",
+).rstrip("/")
+
+# Timeout généreux (Azure App Service peut avoir un cold start).
+HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+action_plan_router = APIRouter(prefix="/action-plan", tags=["action-plan (proxy)"])
+
+
+def _forward_headers(request: Request) -> dict:
+    """Transmet quelques en-têtes utiles (auth) vers l'API externe."""
+    out: dict = {}
+    for name in ("authorization", "x-api-key", "accept-language"):
+        val = request.headers.get(name)
+        if val:
+            out[name] = val
+    return out
+
+
+async def _proxy(method: str, path: str, *, request: Request,
+                 json_body: Any = None, params: dict = None):
+    """Appelle l'API externe et renvoie son JSON (ou propage son erreur)."""
+    url = f"{ACTION_PLAN_API_BASE}{path}"
+    headers = _forward_headers(request)
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            resp = await client.request(method, url, json=json_body,
+                                        params=params, headers=headers)
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502,
+                            detail=f"Impossible de joindre l'API Action Plan ({ACTION_PLAN_API_BASE}).")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504,
+                            detail="L'API Action Plan n'a pas répondu à temps.")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Erreur réseau vers Action Plan: {e}")
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=payload)
+    return payload
+
+
+@action_plan_router.post("/plans")
+async def create_plan(request: Request):
+    """POST -> POST {API}/api/v2/plans (corps JSON transmis tel quel)."""
+    body = await request.json()
+    return await _proxy("POST", "/api/v2/plans", request=request, json_body=body)
+
+
+@action_plan_router.get("/plans")
+async def list_plans(request: Request):
+    """GET -> GET {API}/api/v2/plans (query params transmis)."""
+    params = dict(request.query_params)
+    return await _proxy("GET", "/api/v2/plans", request=request, params=params)
+
+
+@action_plan_router.get("/plans/{plan_id}")
+async def get_plan(plan_id: int, request: Request):
+    """GET -> GET {API}/api/v2/plans/{plan_id}."""
+    return await _proxy("GET", f"/api/v2/plans/{plan_id}", request=request)
+
+
+@action_plan_router.get("/_ping")
+async def ping_action_plan(request: Request):
+    """Vérifie que l'API externe répond -> GET {API}/health."""
+    return await _proxy("GET", "/health", request=request)
+
+
+# Branche les routes /action-plan/* dans l'app
+app.include_router(action_plan_router)
+
+
+# ---------------------------
+# Models (supplier conversations)
+# ---------------------------
 class SupplierConversationIn(BaseModel):
     user_name: str = Field(..., min_length=1, max_length=200)
     conversation: str = Field(..., min_length=1)
@@ -96,7 +192,7 @@ class SujetSummary(BaseModel):
     sujet: str
 
 # ---------------------------
-# NEW: Models (sous-sujet)
+# Models (sous-sujet)
 # ---------------------------
 class SousSujetIn(BaseModel):
     sujet_id: int = Field(..., ge=1)
@@ -144,7 +240,6 @@ class ActionNodeIn(BaseModel):
     plant_site: Optional[str] = None
     sous_actions: Optional[List[SousActionNodeIn]] = None
 
-# CHANGED: payload now expects sous_sujet_id (not sujet_id)
 class ActionsBulkIn(BaseModel):
     sous_sujet_id: int = Field(..., ge=1)
     actions: List[ActionNodeIn]
@@ -161,7 +256,6 @@ class ActionNodeOut(BaseModel):
     sous_actions: Optional[List[SousActionNodeOut]] = None
 
 class ActionsBulkOut(BaseModel):
-    # kept for compatibility; we return parent sujet_id for context
     sujet_id: int
     created: List[ActionNodeOut]
 
@@ -194,12 +288,10 @@ class ActionTreeItem(BaseModel):
     plant_site: Optional[str] = None
     sous_actions: Optional[List[SousActionTreeItem]] = None
 
-# legacy response for GET /actions?sujet_id=...
 class ActionsTreeOut(BaseModel):
     sujet_id: int
     actions: List[ActionTreeItem]
 
-# NEW: tree by sujet including sous-sujets
 class SousSujetTreeItem(BaseModel):
     sous_sujet_id: int
     titre: str
@@ -215,61 +307,7 @@ class SujetTreeOut(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "up"}
-# ---------------------------
-# Models (SUJETS RÉCURSIFS)
-# ---------------------------
-class SujetNodeIn(BaseModel):
-    titre: str = Field(..., min_length=1)
-    description: Optional[str] = None
-    code: Optional[str] = None
-    children: Optional[List["SujetNodeIn"]] = None
 
-SujetNodeIn.model_rebuild()
-
-class SujetNodeOut(BaseModel):
-    id: int
-    titre: str
-    description: Optional[str] = None
-    code: Optional[str] = None
-    children: Optional[List["SujetNodeOut"]] = None
-
-# ---------------------------
-# Models (ACTIONS RÉCURSIVES)
-# ---------------------------
-Status = Literal["nouvelle","en_cours","bloquee","terminee","annulee"]
-
-class ActionV2In(BaseModel):
-    task: str = Field(..., min_length=1)
-    responsible: Optional[str] = None
-    due_date: Optional[date] = None     # conseillé: vraie date
-    status: Status = "nouvelle"
-    # facultatifs (pas en DB2, gardés si ton app les utilise côté front)
-    product_line: Optional[str] = None
-    plant_site: Optional[str] = None
-    children: Optional[List["ActionV2In"]] = None
-
-ActionV2In.model_rebuild()
-
-class ActionV2Out(BaseModel):
-    id: int
-    task: str
-    responsible: Optional[str] = None
-    due_date: Optional[str] = None
-    status: str
-    product_line: Optional[str] = None
-    plant_site: Optional[str] = None
-    children: Optional[List["ActionV2Out"]] = None
-
-# ---------------------------
-# Mapping status app -> DB
-# ---------------------------
-STATUS_MAP_APP_TO_DB = {
-    "nouvelle": "nouveau",
-    "en_cours": "en_cours",
-    "bloquee": "bloque",
-    "terminee": "termine",
-    "annulee": "termine",  # ou élargis la CHECK pour accepter 'annulee'
-}
 # ---------------------------
 # Save conversation
 # ---------------------------
@@ -317,13 +355,11 @@ def list_conversations(
             where.append("LOWER(user_name) LIKE %s")
             params.append(f"%{user_name.lower()}%")
         if client_name:
-            # CHANGED: case-insensitive partial match on client_name
             where.append("LOWER(client_name) LIKE %s")
             params.append(f"%{client_name.lower()}%")
         if assistant_name:
-            # (optionnel) tu peux aussi rendre assistant_name insensible à la casse
-            where.append("assistant_name = %s")
-            params.append(assistant_name)
+            where.append("LOWER(assistant_name) = %s")
+            params.append(assistant_name.lower())
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         cur.execute(
             f"""
@@ -403,7 +439,7 @@ def get_conversations_by_client(
         items = []
         total = 0
         for (cid, uname, aname, cname, dconv, conv, tot) in rows:
-            total = tot  # identique pour toutes les lignes
+            total = tot
             preview = (conv[:160] + "…") if isinstance(conv, str) and len(conv) > 160 else conv
             items.append({
                 "id": cid,
@@ -491,6 +527,7 @@ def list_sujets(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
+    # FIXED: lit bien la table `sujet` (et non `sous_sujet`) et renvoie SujetSummary.
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -502,7 +539,7 @@ def list_sujets(
         cur.execute(
             f"""
             SELECT id, conversation_id, sujet, created_at
-            FROM sous_sujet
+            FROM sujet
             {where_sql}
             ORDER BY created_at DESC, id DESC
             LIMIT %s OFFSET %s;
@@ -510,9 +547,9 @@ def list_sujets(
             (*params, limit, offset),
         )
         rows = cur.fetchall()
-        cur.execute(f"SELECT COUNT(*) FROM sous_sujet {where_sql};", tuple(params))
+        cur.execute(f"SELECT COUNT(*) FROM sujet {where_sql};", tuple(params))
         total = cur.fetchone()[0]
-        items = [SousSujetSummary(id=r[0], sujet_id=r[1], titre=r[2]) for r in rows]
+        items = [SujetSummary(id=r[0], conversation_id=r[1], sujet=r[2]) for r in rows]
         cur.close(); conn.close()
         return {"items": items, "total": total}
     except Exception as e:
@@ -567,7 +604,7 @@ def get_sujet_by_id(id: int = Path(..., ge=1)):
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# NEW: SOUS-SUJETS
+# SOUS-SUJETS
 # ---------------------------
 @app.post("/sous-sujets", response_model=SousSujetOut)
 def create_sous_sujet(payload: SousSujetIn):
@@ -638,7 +675,6 @@ def create_actions_bulk(payload: ActionsBulkIn):
         conn = get_connection()
         cur = conn.cursor()
 
-        # Check sous-sujet exists & get parent sujet_id for response context
         cur.execute("SELECT sujet_id FROM sous_sujet WHERE id=%s;", (payload.sous_sujet_id,))
         row = cur.fetchone()
         if row is None:
@@ -719,7 +755,6 @@ def list_actions_by_sujet(sujet_id: int = Query(..., ge=1)):
             cur.close(); conn.close()
             raise HTTPException(status_code=404, detail="Sujet not found")
 
-        # fetch actions for all sous-sujets and flatten (legacy behavior)
         cur.execute("SELECT id FROM sous_sujet WHERE sujet_id=%s ORDER BY id ASC;", (sujet_id,))
         ss_ids = [r[0] for r in cur.fetchall()]
 
@@ -737,7 +772,6 @@ def list_actions_by_sujet(sujet_id: int = Query(..., ge=1)):
             actions_rows = cur.fetchall()
 
             for (action_id, task, responsible, due_date, status, product_line, plant_site) in actions_rows:
-                # Sous-actions
                 cur.execute(
                     """
                     SELECT id, task, responsible, due_date, status, product_line, plant_site
@@ -751,7 +785,6 @@ def list_actions_by_sujet(sujet_id: int = Query(..., ge=1)):
 
                 sous_items: List[SousActionTreeItem] = []
                 for (sid, stask, sresp, sdue, sstatus, sprod, splant) in sous_rows:
-                    # Sous-sous-actions
                     cur.execute(
                         """
                         SELECT id, task, responsible, due_date, status, product_line, plant_site
@@ -809,7 +842,7 @@ def list_actions_by_sujet(sujet_id: int = Query(..., ge=1)):
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# NEW: full tree by sujet (preferred)
+# full tree by sujet (preferred)
 # ---------------------------
 @app.get("/tree/sujet", response_model=SujetTreeOut)
 def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
@@ -919,219 +952,25 @@ def get_full_tree_by_sujet(sujet_id: int = Query(..., ge=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
-# ---------------------------
-# NEW: Recursive Subjects on DB secondaire (via get_connection_1)
-# ---------------------------
-# --- helper insert récursif sujets -> retourne SujetNodeOut (avec IDs)
-
-def _insert_sujet_recursive(cur, parent_id: Optional[int], node: SujetNodeIn) -> SujetNodeOut:
-    titre = (node.titre or "").strip()
-    if not titre:
-        raise HTTPException(status_code=422, detail="Field 'titre' is required")
-
-    cur.execute("""
-        INSERT INTO sujet (parent_sujet_id, code, titre, description)
-        VALUES (%s,%s,%s,%s)
-        RETURNING id;
-    """, (parent_id, node.code, titre, node.description))
-    sid = cur.fetchone()[0]
-
-    children_out: List[SujetNodeOut] = []
-    for ch in (node.children or []):
-        child_out = _insert_sujet_recursive(cur, sid, ch)
-        children_out.append(child_out)
-
-    return SujetNodeOut(
-        id=sid,
-        titre=titre,
-        description=node.description,
-        code=node.code,
-        children=children_out or None,
-    )
-
-# POST /v2/sujets/tree
-@app.post("/v2/sujets/tree", response_model=SujetNodeOut)
-def create_sujet_tree_v2(root: SujetNodeIn):
-    conn = get_connection_1()
-    try:
-        with conn, conn.cursor() as cur:
-            root_out = _insert_sujet_recursive(cur, None, root)
-            return root_out                    # ✅ renvoie bien SujetNodeOut complet
-    finally:
-        conn.close()
-
-# GET /v2/sujets/tree?root_id=...
-@app.get("/v2/sujets/tree", response_model=SujetNodeOut)
-def get_sujet_tree_v2(root_id: int = Query(..., ge=1)):
-    conn = get_connection_1()
-    try:
-        with conn, conn.cursor() as cur:
-            # Vérifie racine
-            cur.execute("SELECT id, parent_sujet_id, code, titre, description FROM sujet WHERE id=%s;", (root_id,))
-            head = cur.fetchone()
-            if not head:
-                raise HTTPException(status_code=404, detail="Sujet root not found")
-
-            # Récupère tout le sous-arbre en 1 requête
-            cur.execute("""
-                WITH RECURSIVE tree AS (
-                  SELECT id, parent_sujet_id, code, titre, description
-                  FROM sujet
-                  WHERE id = %s
-                  UNION ALL
-                  SELECT s.id, s.parent_sujet_id, s.code, s.titre, s.description
-                  FROM sujet s
-                  JOIN tree t ON s.parent_sujet_id = t.id
-                )
-                SELECT id, parent_sujet_id, code, titre, description
-                FROM tree ORDER BY id;
-            """, (root_id,))
-            rows = cur.fetchall()
-
-        # Reconstruit l'arbre en mémoire
-        by_parent = {}
-        def mk(r):
-            sid, parent, code, titre, desc = r
-            return SujetNodeOut(id=sid, titre=titre, description=desc, code=code, children=[])
-        for r in rows:
-            sid, parent, *_ = r
-            by_parent.setdefault(parent, []).append(mk(r))
-
-        def attach(node: SujetNodeOut):
-            for ch in by_parent.get(node.id, []):
-                node.children.append(ch); attach(ch)
-            if not node.children:
-                node.children = None
-
-        # noeud racine
-        root = mk(head)
-        attach(root)
-        return root
-    finally:
-        conn.close()
+# ===========================================================================
+# NOTE: Les anciennes routes /v2/sujets/tree et /v2/actions/tree (qui
+# écrivaient directement dans la base "Action Plan" via get_connection_1)
+# ont été SUPPRIMÉES. La gestion des plans d'action passe désormais par le
+# proxy vers l'API externe : voir le bloc "PROXY ACTION PLAN" en haut de
+# ce fichier, routes /action-plan/*.
+# ===========================================================================
 
 # ---------------------------
-# NEW: Recursive Actions on DB secondaire (via get_connection_1)
-# ---------------------------
-# --- helper insert récursif actions -> retourne ActionV2Out (avec IDs)
-
-def _insert_action_recursive(cur, parent_action_id: Optional[int], sujet_id: int, node: ActionV2In) -> ActionV2Out:
-    cur.execute("""
-        INSERT INTO action (sujet_id, parent_action_id, type, titre, description, responsable, due_date, statut)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id;
-    """, (
-        sujet_id,
-        parent_action_id,
-        "action",
-        node.task.strip(),
-        None,
-        (node.responsible or None),
-        node.due_date,
-        STATUS_MAP_APP_TO_DB.get(node.status, "nouveau"),
-    ))
-    aid = cur.fetchone()[0]
-
-    children_out: List[ActionV2Out] = []
-    for ch in (node.children or []):
-        child_out = _insert_action_recursive(cur, aid, sujet_id, ch)
-        children_out.append(child_out)
-
-    return ActionV2Out(
-        id=aid,
-        task=node.task,
-        responsible=node.responsible,
-        due_date=(node.due_date.isoformat() if node.due_date else None),
-        status=node.status,
-        product_line=node.product_line,
-        plant_site=node.plant_site,
-        children=children_out or None,
-    )
-
-# POST /v2/actions/tree?sujet_id=...
-@app.post("/v2/actions/tree", response_model=ActionV2Out)
-def create_action_tree_v2(sujet_id: int = Query(..., ge=1), root: ActionV2In = ...):
-    conn = get_connection_1()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (sujet_id,))
-            if cur.fetchone() is None:
-                raise HTTPException(status_code=404, detail="Sujet not found")
-
-            root_out = _insert_action_recursive(cur, None, sujet_id, root)
-            return root_out                    # ✅ renvoie ActionV2Out (pas In)
-    finally:
-        conn.close()
-
-# GET /v2/actions/tree?sujet_id=...
-@app.get("/v2/actions/tree", response_model=List[ActionV2Out])
-def get_actions_tree_v2(sujet_id: int = Query(..., ge=1)):
-    """
-    Récupère l’arbre d’actions récursif pour un sujet (DB secondaire).
-    """
-    conn = get_connection_1()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM sujet WHERE id=%s;", (sujet_id,))
-            if cur.fetchone() is None:
-                raise HTTPException(status_code=404, detail="Sujet not found")
-
-            # Un seul SELECT (pas de N+1)
-            cur.execute("""
-                SELECT id, parent_action_id, type, titre, description, responsable, due_date, statut
-                FROM action
-                WHERE sujet_id=%s
-                ORDER BY id;
-            """, (sujet_id,))
-            rows = cur.fetchall()
-
-        by_parent = {}
-        def mk(r) -> ActionV2Out:
-            aid, parent, type_, titre, descr, resp, due, statut = r
-            return ActionV2Out(
-                id=aid,
-                task=titre,
-                responsible=resp,
-                due_date=(str(due) if due is not None else None),
-                status=statut,
-                product_line=None,
-                plant_site=None,
-                children=[],
-            )
-        for r in rows:
-            aid, parent, *_ = r
-            by_parent.setdefault(parent, []).append(mk(r))
-
-        def attach(node: ActionV2Out):
-            for ch in by_parent.get(node.id, []):
-                node.children.append(ch); attach(ch)
-            if not node.children:
-                node.children = None
-
-        roots: List[ActionV2Out] = []
-        for root in by_parent.get(None, []):
-            attach(root); roots.append(root)
-        return roots
-    finally:
-        conn.close()
-
-
-
-
-# ---------------------------
-# NEW: Save Supplier Conversation
+# Save Supplier Conversation
 # ---------------------------
 @app.post("/supplier/save-conversation", response_model=SupplierConversationOut)
 def save_supplier_conversation(payload: SupplierConversationIn):
-    """
-    Enregistre une conversation fournisseur dans la base supplier_conversation.
-    """
     try:
         from db import get_connection_supplier
         conn = get_connection_supplier()
         cur = conn.cursor()
         date_conv = payload.date_conversation or datetime.utcnow()
-        
+
         cur.execute(
             """
             INSERT INTO conversation (user_name, conversation, date_conversation, supplier_name, assistant_name)
@@ -1155,7 +994,7 @@ def save_supplier_conversation(payload: SupplierConversationIn):
         raise HTTPException(status_code=500, detail=f"Insertion échouée: {e}")
 
 # ---------------------------
-# NEW: List Supplier Conversations
+# List Supplier Conversations
 # ---------------------------
 @app.get("/supplier/conversations")
 def list_supplier_conversations(
@@ -1166,15 +1005,12 @@ def list_supplier_conversations(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """
-    Liste les conversations fournisseurs avec filtres optionnels.
-    """
     try:
         from db import get_connection_supplier
         conn = get_connection_supplier()
         cur = conn.cursor()
         where, params = [], []
-        
+
         if date:
             where.append("DATE(date_conversation AT TIME ZONE 'UTC') = %s")
             params.append(date)
@@ -1185,11 +1021,11 @@ def list_supplier_conversations(
             where.append("LOWER(supplier_name) LIKE %s")
             params.append(f"%{supplier_name.lower()}%")
         if assistant_name:
-            where.append("assistant_name = %s")
-            params.append(assistant_name)
-            
+            where.append("LOWER(assistant_name) = %s")
+            params.append(assistant_name.lower())
+
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        
+
         cur.execute(
             f"""
             SELECT id, user_name, date_conversation, conversation, supplier_name, assistant_name
@@ -1201,10 +1037,10 @@ def list_supplier_conversations(
             (*params, limit, offset),
         )
         rows = cur.fetchall()
-        
+
         cur.execute(f"SELECT COUNT(*) FROM conversation {where_sql};", tuple(params))
         total = cur.fetchone()[0]
-        
+
         items: List[SupplierConversationSummary] = []
         for (cid, uname, dconv, conv, sname, aname) in rows:
             preview = conv[:140]
@@ -1218,7 +1054,7 @@ def list_supplier_conversations(
                     assistant_name=aname
                 )
             )
-        
+
         cur.close()
         conn.close()
         return {"items": items, "total": total}
@@ -1226,18 +1062,15 @@ def list_supplier_conversations(
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# NEW: Get Supplier Conversation by ID
+# Get Supplier Conversation by ID
 # ---------------------------
 @app.get("/supplier/conversations/{id}", response_model=SupplierConversationDetail)
 def get_supplier_conversation_by_id(id: int = Path(..., ge=1)):
-    """
-    Récupère une conversation fournisseur par ID.
-    """
     try:
         from db import get_connection_supplier
         conn = get_connection_supplier()
         cur = conn.cursor()
-        
+
         cur.execute(
             """
             SELECT id, user_name, date_conversation, conversation, supplier_name, assistant_name
@@ -1248,10 +1081,10 @@ def get_supplier_conversation_by_id(id: int = Path(..., ge=1)):
         row = cur.fetchone()
         cur.close()
         conn.close()
-        
+
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
-            
+
         return SupplierConversationDetail(
             id=row[0],
             user_name=row[1],
@@ -1266,20 +1099,17 @@ def get_supplier_conversation_by_id(id: int = Path(..., ge=1)):
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# NEW: Get Supplier Conversations by Supplier Name
+# Get Supplier Conversations by Supplier Name
 # ---------------------------
 @app.get("/supplier/conversations/supplier/{supplier_name}")
 def get_supplier_conversations_by_name(
     supplier_name: str = Path(..., min_length=1),
 ):
-    """
-    Récupère toutes les conversations d'un fournisseur spécifique.
-    """
     try:
         from db import get_connection_supplier
         conn = get_connection_supplier()
         cur = conn.cursor()
-        
+
         cur.execute(
             """
             SELECT
@@ -1320,27 +1150,24 @@ def get_supplier_conversations_by_name(
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
 # ---------------------------
-# NEW: Export Supplier Conversation as TXT
+# Export Supplier Conversation as TXT
 # ---------------------------
 @app.get("/supplier/conversations/{id}/export.txt", response_model=None)
 def export_supplier_conversation_txt(id: int = Path(..., ge=1)):
-    """
-    Exporte une conversation fournisseur en fichier texte.
-    """
     try:
         from fastapi.responses import PlainTextResponse
         from db import get_connection_supplier
-        
+
         conn = get_connection_supplier()
         cur = conn.cursor()
         cur.execute("SELECT conversation FROM conversation WHERE id=%s;", (id,))
         row = cur.fetchone()
         cur.close()
         conn.close()
-        
+
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
-            
+
         txt = row[0].replace(" , ", "\n")
         return PlainTextResponse(content=txt, media_type="text/plain")
     except HTTPException:
