@@ -45,6 +45,69 @@ HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 action_plan_router = APIRouter(prefix="/action-plan", tags=["action-plan (proxy)"])
 
 
+# --- Modèles d'entrée (souples : champs libres) pour afficher un champ + exemple
+#     dans Swagger. extra="allow" => tout champ supplémentaire est conservé et
+#     transmis tel quel à l'API externe (comportement passthrough).
+from pydantic import ConfigDict
+
+
+class PlanV2In(BaseModel):
+    model_config = ConfigDict(extra="allow", json_schema_extra={
+        "example": {
+            "version": "2.0",
+            "plan_code": "AP-2026-001",
+            "plan_title": "Plan de la réunion",
+            "inserted_by": "ali",
+            "sujets": [
+                {
+                    "titre": "Sujet principal",
+                    "code": "SUJ-1",
+                    "description": "Description du sujet",
+                    "actions": [
+                        {
+                            "titre": "Faire X",
+                            "status": "open",
+                            "due_date": "2026-07-01",
+                            "importance": "haute",
+                            "urgency": "Flexible",
+                            "responsable": "jane.doe",
+                            "sous_actions": [
+                                {"titre": "Sous-tâche", "status": "open"}
+                            ]
+                        }
+                    ],
+                    "sous_sujets": []
+                }
+            ]
+        }
+    })
+    version: Optional[str] = "2.0"
+    plan_title: str = Field(..., min_length=1)
+
+
+class ActionV2CreateIn(BaseModel):
+    model_config = ConfigDict(extra="allow", json_schema_extra={
+        "example": {
+            "sujet_id": 1,
+            "parent_action_id": None,
+            "titre": "Nouvelle action",
+            "status": "open",
+            "due_date": "2026-07-01",
+            "importance": "moyenne",
+            "responsable": "jane.doe"
+        }
+    })
+    sujet_id: int = Field(..., ge=1)
+    titre: str = Field(..., min_length=1)
+
+
+class StatusUpdateIn(BaseModel):
+    model_config = ConfigDict(extra="allow", json_schema_extra={
+        "example": {"status": "closed"}
+    })
+    status: str = Field(..., description="open | closed | blocked")
+
+
 def _forward_headers(request: Request) -> dict:
     """Transmet quelques en-têtes utiles (auth) vers l'API externe."""
     out: dict = {}
@@ -101,9 +164,9 @@ async def _proxy(method: str, path: str, *, request: Request,
 
 
 @action_plan_router.post("/plans")
-async def create_plan(request: Request):
-    """POST -> POST {API}/api/v2/plans (corps JSON transmis tel quel)."""
-    body = await _read_json_body(request)
+async def create_plan(payload: PlanV2In, request: Request):
+    """POST -> POST {API}/api/v2/plans. Crée un plan complet (sujets + actions)."""
+    body = payload.model_dump(exclude_none=False)
     return await _proxy("POST", "/api/v2/plans", request=request, json_body=body)
 
 
@@ -121,20 +184,16 @@ async def get_plan(sujet_id: int, request: Request):
 
 
 @action_plan_router.post("/actions")
-async def create_action(request: Request):
-    """
-    POST -> POST {API}/api/v2/actions (ajoute UNE action à un sujet existant).
-    Corps attendu : { "sujet_id": int, "parent_action_id": int|null,
-    "titre": str, "status": "open"|"closed"|"blocked", "due_date": "YYYY-MM-DD", ... }
-    """
-    body = await _read_json_body(request)
+async def create_action(payload: ActionV2CreateIn, request: Request):
+    """POST -> POST {API}/api/v2/actions (ajoute UNE action à un sujet existant)."""
+    body = payload.model_dump(exclude_none=False)
     return await _proxy("POST", "/api/v2/actions", request=request, json_body=body)
 
 
 @action_plan_router.patch("/actions/{action_id}/status")
-async def update_action_status(action_id: int, request: Request):
+async def update_action_status(action_id: int, payload: StatusUpdateIn, request: Request):
     """PATCH -> PATCH {API}/api/v2/actions/{id}/status. Corps : { "status": "open|closed|blocked" }."""
-    body = await _read_json_body(request)
+    body = payload.model_dump(exclude_none=False)
     return await _proxy("PATCH", f"/api/v2/actions/{action_id}/status",
                         request=request, json_body=body)
 
