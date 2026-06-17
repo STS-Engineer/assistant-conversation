@@ -5,3 +5,4 @@ typing_extensions
 uvicorn[standard]
 gunicorn
 psycopg2-binary
+httpx
