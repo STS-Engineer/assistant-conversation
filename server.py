@@ -435,6 +435,7 @@ def _ap_fetch_tree(conn, sujet_id):
 class PlanV2In(BaseModel):
     model_config = ConfigDict(extra="allow", json_schema_extra={"example": {
         "version": "2.0", "plan_code": "AP-2026-001", "plan_title": "Plan de la réunion",
+        "conversation_id": 116,
         "inserted_by": "ali", "demandeur": "ali", "email_demandeur": "ali@example.com",
         "sujets": [{
             "titre": "Sujet principal", "code": "SUJ-1", "description": "Description",
@@ -482,14 +483,27 @@ def ap_check():
 
 @action_plan_router.post("/plans")
 def ap_create_plan(payload: PlanV2In):
-    """Crée un plan complet (sujet racine + sujets + actions récursives)."""
+    """Crée un plan complet (sujet racine + sujets + actions récursives).
+
+    Astuce de liaison : si le corps contient un champ "conversation_id",
+    un marqueur [conversation_id=N] est ajouté à la description du sujet
+    racine, sans modifier la base. On peut ensuite retrouver le plan via
+    GET /action-plan/plans/by-conversation/{conversation_id}.
+    """
     plan = payload.model_dump(exclude_none=False)
     engine = get_action_plan_engine()
+
+    # Construit la description racine, avec marqueur de conversation si fourni.
+    root_desc = "Action plan root (v2)"
+    conv_id = plan.get("conversation_id")
+    if conv_id is not None:
+        root_desc = f"[conversation_id={conv_id}] {root_desc}"
+
     try:
         with engine.begin() as conn:
             created_s, created_a = [], []
             root_id = _ap_upsert_sujet(conn, plan["plan_title"], None,
-                                       plan.get("plan_code"), "Action plan root (v2)",
+                                       plan.get("plan_code"), root_desc,
                                        plan.get("inserted_by"))
             created_s.append(int(root_id))
             for s in (plan.get("sujets") or []):
@@ -586,6 +600,33 @@ def ap_list_plans():
                           ap_sujet.c.description, ap_sujet.c.inserted_by, ap_sujet.c.created_at) \
                 .where(ap_sujet.c.parent_sujet_id.is_(None))
             return [_ap_json_ready(dict(r._mapping)) for r in conn.execute(stmt).fetchall()]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+
+@action_plan_router.get("/plans/by-conversation/{conversation_id}")
+def ap_plans_by_conversation(conversation_id: int = Path(..., ge=1), full: bool = Query(False)):
+    """Retrouve les plans liés à une conversation via le marqueur
+    [conversation_id=N] présent dans la description du sujet racine.
+
+    - full=false (défaut) : renvoie la liste des plans racines correspondants.
+    - full=true            : renvoie aussi l'arbre complet de chaque plan.
+    """
+    engine = get_action_plan_engine()
+    marker = f"[conversation_id={conversation_id}]"
+    try:
+        with engine.connect() as conn:
+            stmt = select(ap_sujet.c.id, ap_sujet.c.titre, ap_sujet.c.code,
+                          ap_sujet.c.description, ap_sujet.c.inserted_by, ap_sujet.c.created_at) \
+                .where(ap_sujet.c.parent_sujet_id.is_(None),
+                       ap_sujet.c.description.like(f"%{marker}%"))
+            roots = [_ap_json_ready(dict(r._mapping)) for r in conn.execute(stmt).fetchall()]
+            if full:
+                roots = [_ap_fetch_tree(conn, r["id"]) for r in roots]
+            return {"conversation_id": conversation_id, "marker": marker,
+                    "count": len(roots), "plans": roots}
     except HTTPException:
         raise
     except Exception as e:
